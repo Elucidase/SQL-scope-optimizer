@@ -1,0 +1,498 @@
+{
+    "version": 130003,
+    "stmts": [
+        {
+            "stmt": {
+                "SelectStmt": {
+                    "targetList": [
+                        {
+                            "ResTarget": {
+                                "val": {
+                                    "ColumnRef": {
+                                        "fields": [
+                                            {
+                                                "String": {
+                                                    "str": "t1"
+                                                }
+                                            },
+                                            {
+                                                "String": {
+                                                    "str": "contest_id"
+                                                }
+                                            }
+                                        ],
+                                        "location": 8
+                                    }
+                                },
+                                "location": 8
+                            }
+                        },
+                        {
+                            "ResTarget": {
+                                "name": "percentage",
+                                "val": {
+                                    "FuncCall": {
+                                        "funcname": [
+                                            {
+                                                "String": {
+                                                    "str": "round"
+                                                }
+                                            }
+                                        ],
+                                        "args": [
+                                            {
+                                                "TypeCast": {
+                                                    "arg": {
+                                                        "FuncCall": {
+                                                            "funcname": [
+                                                                {
+                                                                    "String": {
+                                                                        "str": "div"
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "args": [
+                                                                {
+                                                                    "A_Expr": {
+                                                                        "kind": "AEXPR_OP",
+                                                                        "name": [
+                                                                            {
+                                                                                "String": {
+                                                                                    "str": "*"
+                                                                                }
+                                                                            }
+                                                                        ],
+                                                                        "lexpr": {
+                                                                            "FuncCall": {
+                                                                                "funcname": [
+                                                                                    {
+                                                                                        "String": {
+                                                                                            "str": "count"
+                                                                                        }
+                                                                                    }
+                                                                                ],
+                                                                                "args": [
+                                                                                    {
+                                                                                        "ColumnRef": {
+                                                                                            "fields": [
+                                                                                                {
+                                                                                                    "String": {
+                                                                                                        "str": "t2"
+                                                                                                    }
+                                                                                                },
+                                                                                                {
+                                                                                                    "String": {
+                                                                                                        "str": "user_id"
+                                                                                                    }
+                                                                                                }
+                                                                                            ],
+                                                                                            "location": 52
+                                                                                        }
+                                                                                    }
+                                                                                ],
+                                                                                "location": 46
+                                                                            }
+                                                                        },
+                                                                        "rexpr": {
+                                                                            "A_Const": {
+                                                                                "val": {
+                                                                                    "Integer": {
+                                                                                        "ival": 100
+                                                                                    }
+                                                                                },
+                                                                                "location": 67
+                                                                            }
+                                                                        },
+                                                                        "location": 65
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "FuncCall": {
+                                                                        "funcname": [
+                                                                            {
+                                                                                "String": {
+                                                                                    "str": "count"
+                                                                                }
+                                                                            }
+                                                                        ],
+                                                                        "args": [
+                                                                            {
+                                                                                "ColumnRef": {
+                                                                                    "fields": [
+                                                                                        {
+                                                                                            "String": {
+                                                                                                "str": "t1"
+                                                                                            }
+                                                                                        },
+                                                                                        {
+                                                                                            "String": {
+                                                                                                "str": "user_id"
+                                                                                            }
+                                                                                        }
+                                                                                    ],
+                                                                                    "location": 77
+                                                                                }
+                                                                            }
+                                                                        ],
+                                                                        "location": 71
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "location": 41
+                                                        }
+                                                    },
+                                                    "typeName": {
+                                                        "names": [
+                                                            {
+                                                                "String": {
+                                                                    "str": "pg_catalog"
+                                                                }
+                                                            },
+                                                            {
+                                                                "String": {
+                                                                    "str": "numeric"
+                                                                }
+                                                            }
+                                                        ],
+                                                        "typemod": -1,
+                                                        "location": 93
+                                                    },
+                                                    "location": 36
+                                                }
+                                            },
+                                            {
+                                                "A_Const": {
+                                                    "val": {
+                                                        "Integer": {
+                                                            "ival": 2
+                                                        }
+                                                    },
+                                                    "location": 102
+                                                }
+                                            }
+                                        ],
+                                        "location": 30
+                                    }
+                                },
+                                "location": 30
+                            }
+                        }
+                    ],
+                    "fromClause": [
+                        {
+                            "JoinExpr": {
+                                "jointype": "JOIN_LEFT",
+                                "larg": {
+                                    "RangeSubselect": {
+                                        "subquery": {
+                                            "SelectStmt": {
+                                                "targetList": [
+                                                    {
+                                                        "ResTarget": {
+                                                            "val": {
+                                                                "ColumnRef": {
+                                                                    "fields": [
+                                                                        {
+                                                                            "A_Star": {}
+                                                                        }
+                                                                    ],
+                                                                    "location": 135
+                                                                }
+                                                            },
+                                                            "location": 135
+                                                        }
+                                                    }
+                                                ],
+                                                "fromClause": [
+                                                    {
+                                                        "JoinExpr": {
+                                                            "jointype": "JOIN_INNER",
+                                                            "larg": {
+                                                                "RangeSubselect": {
+                                                                    "subquery": {
+                                                                        "SelectStmt": {
+                                                                            "distinctClause": [
+                                                                                {}
+                                                                            ],
+                                                                            "targetList": [
+                                                                                {
+                                                                                    "ResTarget": {
+                                                                                        "val": {
+                                                                                            "ColumnRef": {
+                                                                                                "fields": [
+                                                                                                    {
+                                                                                                        "String": {
+                                                                                                            "str": "contest_id"
+                                                                                                        }
+                                                                                                    }
+                                                                                                ],
+                                                                                                "location": 165
+                                                                                            }
+                                                                                        },
+                                                                                        "location": 165
+                                                                                    }
+                                                                                }
+                                                                            ],
+                                                                            "fromClause": [
+                                                                                {
+                                                                                    "RangeVar": {
+                                                                                        "relname": "register",
+                                                                                        "inh": true,
+                                                                                        "relpersistence": "p",
+                                                                                        "location": 183
+                                                                                    }
+                                                                                }
+                                                                            ],
+                                                                            "limitOption": "LIMIT_OPTION_DEFAULT",
+                                                                            "op": "SETOP_NONE"
+                                                                        }
+                                                                    },
+                                                                    "alias": {
+                                                                        "aliasname": "co"
+                                                                    }
+                                                                }
+                                                            },
+                                                            "rarg": {
+                                                                "RangeSubselect": {
+                                                                    "subquery": {
+                                                                        "SelectStmt": {
+                                                                            "distinctClause": [
+                                                                                {}
+                                                                            ],
+                                                                            "targetList": [
+                                                                                {
+                                                                                    "ResTarget": {
+                                                                                        "val": {
+                                                                                            "ColumnRef": {
+                                                                                                "fields": [
+                                                                                                    {
+                                                                                                        "String": {
+                                                                                                            "str": "user_id"
+                                                                                                        }
+                                                                                                    }
+                                                                                                ],
+                                                                                                "location": 235
+                                                                                            }
+                                                                                        },
+                                                                                        "location": 235
+                                                                                    }
+                                                                                }
+                                                                            ],
+                                                                            "fromClause": [
+                                                                                {
+                                                                                    "RangeVar": {
+                                                                                        "relname": "users",
+                                                                                        "inh": true,
+                                                                                        "relpersistence": "p",
+                                                                                        "location": 250
+                                                                                    }
+                                                                                }
+                                                                            ],
+                                                                            "limitOption": "LIMIT_OPTION_DEFAULT",
+                                                                            "op": "SETOP_NONE"
+                                                                        }
+                                                                    },
+                                                                    "alias": {
+                                                                        "aliasname": "us"
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                ],
+                                                "limitOption": "LIMIT_OPTION_DEFAULT",
+                                                "op": "SETOP_NONE"
+                                            }
+                                        },
+                                        "alias": {
+                                            "aliasname": "t1"
+                                        }
+                                    }
+                                },
+                                "rarg": {
+                                    "RangeVar": {
+                                        "relname": "register",
+                                        "inh": true,
+                                        "relpersistence": "p",
+                                        "alias": {
+                                            "aliasname": "t2"
+                                        },
+                                        "location": 283
+                                    }
+                                },
+                                "quals": {
+                                    "BoolExpr": {
+                                        "boolop": "AND_EXPR",
+                                        "args": [
+                                            {
+                                                "A_Expr": {
+                                                    "kind": "AEXPR_OP",
+                                                    "name": [
+                                                        {
+                                                            "String": {
+                                                                "str": "="
+                                                            }
+                                                        }
+                                                    ],
+                                                    "lexpr": {
+                                                        "ColumnRef": {
+                                                            "fields": [
+                                                                {
+                                                                    "String": {
+                                                                        "str": "t1"
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "String": {
+                                                                        "str": "contest_id"
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "location": 302
+                                                        }
+                                                    },
+                                                    "rexpr": {
+                                                        "ColumnRef": {
+                                                            "fields": [
+                                                                {
+                                                                    "String": {
+                                                                        "str": "t2"
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "String": {
+                                                                        "str": "contest_id"
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "location": 318
+                                                        }
+                                                    },
+                                                    "location": 316
+                                                }
+                                            },
+                                            {
+                                                "A_Expr": {
+                                                    "kind": "AEXPR_OP",
+                                                    "name": [
+                                                        {
+                                                            "String": {
+                                                                "str": "="
+                                                            }
+                                                        }
+                                                    ],
+                                                    "lexpr": {
+                                                        "ColumnRef": {
+                                                            "fields": [
+                                                                {
+                                                                    "String": {
+                                                                        "str": "t1"
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "String": {
+                                                                        "str": "user_id"
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "location": 338
+                                                        }
+                                                    },
+                                                    "rexpr": {
+                                                        "ColumnRef": {
+                                                            "fields": [
+                                                                {
+                                                                    "String": {
+                                                                        "str": "t2"
+                                                                    }
+                                                                },
+                                                                {
+                                                                    "String": {
+                                                                        "str": "user_id"
+                                                                    }
+                                                                }
+                                                            ],
+                                                            "location": 351
+                                                        }
+                                                    },
+                                                    "location": 349
+                                                }
+                                            }
+                                        ],
+                                        "location": 333
+                                    }
+                                }
+                            }
+                        }
+                    ],
+                    "groupClause": [
+                        {
+                            "ColumnRef": {
+                                "fields": [
+                                    {
+                                        "String": {
+                                            "str": "t1"
+                                        }
+                                    },
+                                    {
+                                        "String": {
+                                            "str": "contest_id"
+                                        }
+                                    }
+                                ],
+                                "location": 373
+                            }
+                        }
+                    ],
+                    "sortClause": [
+                        {
+                            "SortBy": {
+                                "node": {
+                                    "ColumnRef": {
+                                        "fields": [
+                                            {
+                                                "String": {
+                                                    "str": "percentage"
+                                                }
+                                            }
+                                        ],
+                                        "location": 396
+                                    }
+                                },
+                                "sortby_dir": "SORTBY_DESC",
+                                "sortby_nulls": "SORTBY_NULLS_DEFAULT",
+                                "location": -1
+                            }
+                        },
+                        {
+                            "SortBy": {
+                                "node": {
+                                    "ColumnRef": {
+                                        "fields": [
+                                            {
+                                                "String": {
+                                                    "str": "t1"
+                                                }
+                                            },
+                                            {
+                                                "String": {
+                                                    "str": "contest_id"
+                                                }
+                                            }
+                                        ],
+                                        "location": 422
+                                    }
+                                },
+                                "sortby_dir": "SORTBY_ASC",
+                                "sortby_nulls": "SORTBY_NULLS_DEFAULT",
+                                "location": -1
+                            }
+                        }
+                    ],
+                    "limitOption": "LIMIT_OPTION_DEFAULT",
+                    "op": "SETOP_NONE"
+                }
+            }
+        }
+    ]
+}
