@@ -2,9 +2,11 @@ import itertools
 from typing import Dict, Tuple
 import pglast
 from pglast import parser, parse_sql, Missing
+from pglast.visitors import Visitor
 import json
 
 TOP = "%top%"
+AGGREGATE_NAMES = ["count", "sum", "min", "max", "avg"]
     
 class Column:
     """
@@ -92,8 +94,10 @@ class BasicAnalyzer:
         top_level_tables_inside (Dict[str, list]): table name -> list of top-level tables directly inside
         columns (Dict[str, Dict[str, Column]]): table name -> dict from column name to Column object
         unique_column_tuples (Dict[str, list]): table name -> list of column names or combination of column names that are unique
-        root: root node
-        schema: parsed from json
+        root (pglast.node.Node): root node
+        schema (dict): parsed from json
+        center_columns (list[list[Tuple[str, str]]]): possibilities for each center column
+        holes (list[pglast.node.Node]): hole id -> function_call
     """
     def __init__(self, sql, schema_file):
         self.table_node: Dict[str, pglast.node.Node] = {}
@@ -107,14 +111,10 @@ class BasicAnalyzer:
             
     def __call__(self):
         self.find_hierarchy()
-        # print(self.top_level_tables_inside)
-        # print(self.table_node)
         self.fill_columns_raw()
         self.fill_columns_dfs(TOP)
-        # print(self.columns)
-        # print(self.unique_column_tuples)
         self.find_center_columns()
-        print(self.center_columns)
+        self.find_holes()
 
     def find_hierarchy(self):
         """fill in top_level_tables_inside and table_node"""
@@ -164,7 +164,6 @@ class BasicAnalyzer:
         if node.node_tag == "RangeVar":
             # table_name is alias for relname
             relname = node.relname.value
-            print(table_name, relname)
             if table_name == relname or relname not in self.table_node:
                 # relname is a raw table
                 self.top_level_tables_inside[table_name] = []
@@ -310,7 +309,7 @@ class BasicAnalyzer:
                         result_tuple.append(inner_columns[column])
             self.unique_column_tuples[table_name] = [result_tuple]
         else: 
-            # unique tuples for each child table
+            # nothing to guarentee uniqueness, so we use the cartesian product of child unique tuples
             uniques_of_children = []
             for table in top_level_tables:
                 tabled_unique_tuples = []
@@ -327,6 +326,7 @@ class BasicAnalyzer:
                     self.unique_column_tuples[table_name].append(candidate_tuple)
                     
     def column_object(self, table_name: str, column_name: str):
+        """return Column object for table_name.column_name"""
         if column_name not in self.columns[table_name]:
             raise Exception(f"column {column_name} needs to be qualified with table name")
         return self.columns[table_name][column_name]
@@ -347,11 +347,11 @@ class BasicAnalyzer:
                 exact_inner = self.column_object(TOP, column_name).exact_inner
             else:
                 exact_inner = Column.columnRef_to_exact_inner(columnRef)
-            sources = self.trace_column_to_raw(exact_inner)
+            sources = self.trace_column_to_raw_dfs(exact_inner)
             self.center_columns.append(sorted(set(sources)))
             
                 
-    def trace_column_to_raw(self, exact_inner: Tuple[str, str]):
+    def trace_column_to_raw_dfs(self, exact_inner: Tuple[str, str]):
         """helper function of find_center_columns"""
         scope, name = exact_inner
         column = self.column_object(*exact_inner)
@@ -366,36 +366,48 @@ class BasicAnalyzer:
             columns_to_explore = column.dependsOn
         result = []
         for inner_column in columns_to_explore:
-            result.extend(self.trace_column_to_raw(inner_column))
+            result.extend(self.trace_column_to_raw_dfs(inner_column))
         return result
         
-    
+    def find_holes(self):
+        """Find all holes"""
+        top = self.table_node[TOP]
+        self.holes = []
+        # assume top-level select statement does not have set operation
+        if top.op.value != pglast.enums.parsenodes.SetOperation.SETOP_NONE:
+            raise Exception("Run this algorithm on each top-level set (e.g. component of UNION)!")
+        class HoleVisitor(Visitor):
+            def __init__(self, holes):
+                self.holes = holes
+            def visit_FuncCall(self, _, node):
+                if node.funcname[0].val in AGGREGATE_NAMES:
+                    self.holes.append(node)
+            def visit_FromClause(self):
+                return pglast.visitors.Skip()   
+            def visit_WithClause(self):
+                return pglast.visitors.Skip()  
+            # do not consider SubLink yet
+            def visit_SubLink(self):
+                return pglast.visitors.Skip()    
+        visitor = HoleVisitor(self.holes)
+        visitor(top.ast_node)
+            
     
     
 if __name__ == "__main__":           
-    schema_file = "1633schema.json"
+    schema_file = "1212schema.json"
     # sql = """WITH cte AS (SELECT 1 as cst1, a.a1 as a1 FROM a) SELECT (SELECT 3 FROM d) k2, a2.a + 1 k2 FROM c c2 CROSS JOIN (SELECT * FROM a) as a2 WHERE EXISTS (SELECT 3 FROM d)"""
-    sql = """SELECT  t1.contest_id
-       ,round(cast(div((COUNT(t2.user_id)) * 100,COUNT(t1.user_id)) AS numeric),2) AS percentage
-FROM
-(
-	SELECT  *
-	FROM
-	(
-		SELECT  distinct register.contest_id
-		FROM register
-	) AS co
-	CROSS JOIN
-	(
-		SELECT  distinct users.user_id
-		FROM users
-	) AS us
-) AS t1
-LEFT JOIN register AS t2
-ON (t1.contest_id = t2.contest_id) AND (t1.user_id = t2.user_id)
-GROUP BY  t1.contest_id
-ORDER BY percentage desc
-         ,t1.contest_id asc"""
+    sql = """SELECT  t.team_id
+       ,t.team_name
+       ,(SUM(CASE WHEN ((t.team_id = m.host_team) AND (m.host_goals > m.guest_goals)) OR ((t.team_id = m.guest_team) AND (m.host_goals < m.guest_goals)) THEN 3 ELSE 0 END)) + (SUM(CASE WHEN ((t.team_id = m.host_team) AND (m.host_goals = m.guest_goals)) OR ((t.team_id = m.guest_team) AND (m.host_goals = m.guest_goals)) THEN 1 ELSE 0 END)) AS num_points
+FROM Teams AS t
+CROSS JOIN Matches AS m
+GROUP BY  t.team_id
+         ,t.team_name
+ORDER BY num_points DESC
+         ,t.team_id ASC"""
     analyzer = BasicAnalyzer(sql, schema_file)
     analyzer()
     print(analyzer.center_columns)
+    for hole in analyzer.holes:
+        print(hole, "\n")
