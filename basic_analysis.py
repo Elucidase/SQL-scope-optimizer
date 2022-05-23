@@ -277,7 +277,7 @@ class BasicAnalyzer:
         elif node.groupClause is not Missing:
             group_by_columns = node.groupClause
             tabled_group_by_columns = []
-            result_tuple = []
+            cartesian_components = []
             # assume each gruop by column is either t.c or the name of a column in select clause
             for columnRef in group_by_columns:
                 if len(columnRef.fields) == 1:
@@ -285,41 +285,44 @@ class BasicAnalyzer:
                     exact_inner = self.column_object(table_name, column_name).exact_inner
                     if exact_inner is None:
                         # columns that are not a column of an inner table
-                        result_tuple.append(column_name)
+                        cartesian_components.append([[column_name]])
                     else:
                         tabled_group_by_columns.append(exact_inner)
                 else:
                     tabled_group_by_columns.append(Column.columnRef_to_exact_inner(columnRef))
-            # for columns belonging to the same child table, try to eliminate unnecessary columns with unique info
+            # for group-by columns belonging to the same child table, try to eliminate some with unique info
+            # i.e. find all child unique tuples for each child table that is a subset of the group-by columns
             tabled_group_by_columns.sort(key = lambda table_column: table_column[0])
             by_table = itertools.groupby(tabled_group_by_columns, lambda table_column: table_column[0])
             by_table = {table: [table_column[1] for table_column in table_columns] for table, table_columns in by_table}
             for table in by_table:
+                cartesian_component = []
+                group_columns = by_table[table]
                 for unique_tuple in self.unique_column_tuples[table]:
-                    if all(column_name in by_table[table] for column_name in unique_tuple):
-                        by_table[table] = unique_tuple
-                        break
-                # convert it back to columns present in select clause and add to result
-                for column_name in by_table[table]:
-                    column = (table, column_name)
-                    if column not in inner_columns:
-                        print("Warning: table", table_name, "group-by column", column_name, "not selected")
-                        return
-                    else:
-                        result_tuple.append(inner_columns[column])
-            self.unique_column_tuples[table_name] = [result_tuple]
+                    if all(column in group_columns for column in unique_tuple) and \
+                        all((table, column) in inner_columns for column in unique_tuple):
+                        # convert it back to columns present in select clause and add to result
+                        cartesian_component.append([inner_columns[(table, column)] for column in unique_tuple])
+                # can't simplify, try default
+                if len(cartesian_component) == 0:
+                    if all((table, column) in inner_columns for column in group_columns):
+                        cartesian_component.append([inner_columns[(table, column)] for column in unique_tuple])
+                cartesian_components.append(cartesian_component)
+            product = itertools.product(*cartesian_components)
+            self.unique_column_tuples[table_name] = [list(itertools.chain.from_iterable(cols)) for cols in product]
         else: 
             # nothing to guarentee uniqueness, so we use the cartesian product of child unique tuples
-            uniques_of_children = []
+            cartesian_components = []
             for table in top_level_tables:
                 tabled_unique_tuples = []
                 for unique_column_tuple in self.unique_column_tuples[table]:
                     tabled_unique_tuples.append([(table, column) for column in unique_column_tuple])
-                uniques_of_children.append(tabled_unique_tuples)
+                cartesian_components.append(tabled_unique_tuples)
             # a column tuple that contains a unique column (tuple) for each child table is unique
             # so we take Cartesian product of the unique column (tuple) of children tables
-            product = itertools.product(*uniques_of_children)
+            product = itertools.product(*cartesian_components)
             candidate_tuples = [list(itertools.chain.from_iterable(cols)) for cols in product]
+            # if a candidate tuple is a subset of what we select, accept it
             for candidate_tuple in candidate_tuples:
                 if all(column in inner_columns for column in candidate_tuple):
                     candidate_tuple = [inner_columns[column] for column in candidate_tuple]
@@ -395,19 +398,9 @@ class BasicAnalyzer:
     
     
 if __name__ == "__main__":           
-    schema_file = "1212schema.json"
+    schema_file = "testschema.json"
     # sql = """WITH cte AS (SELECT 1 as cst1, a.a1 as a1 FROM a) SELECT (SELECT 3 FROM d) k2, a2.a + 1 k2 FROM c c2 CROSS JOIN (SELECT * FROM a) as a2 WHERE EXISTS (SELECT 3 FROM d)"""
-    sql = """SELECT  t.team_id
-       ,t.team_name
-       ,(SUM(CASE WHEN ((t.team_id = m.host_team) AND (m.host_goals > m.guest_goals)) OR ((t.team_id = m.guest_team) AND (m.host_goals < m.guest_goals)) THEN 3 ELSE 0 END)) + (SUM(CASE WHEN ((t.team_id = m.host_team) AND (m.host_goals = m.guest_goals)) OR ((t.team_id = m.guest_team) AND (m.host_goals = m.guest_goals)) THEN 1 ELSE 0 END)) AS num_points
-FROM Teams AS t
-CROSS JOIN Matches AS m
-GROUP BY  t.team_id
-         ,t.team_name
-ORDER BY num_points DESC
-         ,t.team_id ASC"""
+    sql = """SELECT a.id id1, c.id id2, c.c1 c1 FROM a CROSS JOIN c GROUP BY a.id, c.id, c.c1"""
     analyzer = BasicAnalyzer(sql, schema_file)
     analyzer()
-    print(analyzer.center_columns)
-    for hole in analyzer.holes:
-        print(hole, "\n")
+    print(analyzer.unique_column_tuples)
