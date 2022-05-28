@@ -17,9 +17,9 @@ For each hole:
     While new_branches is not empty:
         next_branches = []
         For branch in new_branches:
-            If branch have a single top-level table and the table is raw:
-                branch.leaf = true
-                break
+            If branch has top-level set operation (i.e. UNION):
+                For each set operand, assign new id and add to next_branch
+                continue
             
             // Phase 1: Cut off irrelevant tables
             Find all top level tables for the current scope
@@ -31,40 +31,49 @@ For each hole:
             Remove all other clusters
             Check if the hole is idempotent (and incur panelty if needed)
 
+            If branch have a single top-level table:
+                Change column to be from smaller scope
+                Add to next_branch, id_to_branch[subbranch.id]
+                continue
+
             If there is a remaining cluster and it is independent of I:
                 Remove I
                 branch.free = true
                 Restart the whole algorithm on this cluster
-
+            
+            
+            // Phase 2: Split branches to resolve crossing
             If there is a remaining cluster:
-                // Phase 2: Split branches to resolve crossing
-                Convert predicate into CNF
-                Collect conditions 1. that are conjuncts of CNF that cross 2. of CASE WHENs that cross
-                disjunctions = []
-                Spawn a "raw subbranch" for each possibility of the combination of the conditions (product rule)
-                    For each raw branch, simplify expression with Z3 strategy
-                    subbranch.parent = branch
-                    subbranch.id = ++global_counter
-                    Add subbranch.id to branch.children
-                    Add the subbranch to disjunctions
-                
-                // Phase 3.2:
-                For each raw subbranch in disjunctions:
-                    subbranches_key_pushed = []
-                    If GROUP BY key is unique and Property 6/7 is satisfied:
-                        Push key in accordingly and add to subbranches_key_pushed
-                    Else if one-to-one left join and Property 8 is satisfied:
-                        Push key in accordingly and add to subbranches_key_pushed
-                    Else:
-                        Buy assumptions to satisfy Property 6/7 or 8, add penalty, push in key
-                        For each possibility of buying assumptions, add to subbranch_key_pushed
-                    For each subbranch in subbranches_key_pushed:
-                        Push in filter (and buy assumptions)
-                        For each possibility of buying assumptions, add to next_branch and id_to_branch[subbranch.id]
-            Else:
-                // Phase 3.1:
-                Change column to be from smaller scope
-                Add to next_branch, id_to_branch[subbranch.id]
+                outer = I, inners = cluster
+            Else if hole involves two or more tables:
+                outer = one table, inners = remaining
+            // crossing := anything that involve outer and a table from inner
+            Convert predicate into CNF
+            Collect conditions 1. that are conjuncts of CNF that cross 2. of CASE WHENs that cross
+            disjunctions = []
+            Spawn a "raw subbranch" for each possibility of the combination of the conditions (product rule)
+                For each raw branch, simplify expression with Z3 strategy
+                subbranch.parent = branch
+                subbranch.id = ++global_counter
+                Add subbranch.id to branch.children
+                Add the subbranch to disjunctions
+            
+            // Phase 3:
+            For each raw subbranch in disjunctions:
+                subbranches_key_pushed = []
+                If GROUP BY key is unique and Property 6/7 is satisfied:
+                    Push key in accordingly and add to subbranches_key_pushed
+                Else if one-to-one left join and Property 8 is satisfied:
+                    Push key in accordingly and add to subbranches_key_pushed
+                Else:
+                    Buy assumptions to satisfy Property 6/7 or 8, add penalty, push in key
+                    For each possibility of buying assumptions, add to subbranch_key_pushed
+                For each subbranch in subbranches_key_pushed:
+                    Push in filter (and buy assumptions)
+                    For each possibility of buying assumptions, add to next_branch and id_to_branch[subbranch.id]
+
+            If the branch is intact during the whole process:
+                branch.leaf = true
 
 
         new_branches = next_branches
