@@ -1,0 +1,119 @@
+{
+  "Problem Number": "0",
+  "Tables": [
+    {
+      "TableName": "i",
+      "PKeys": [
+        {
+          "Name": "id",
+          "Type": "int"
+        }
+      ],
+      "FKeys": [],
+      "Others": [
+        {
+          "Name": "x",
+          "Type": "int"
+        },
+        {
+          "Name": "x1",
+          "Type": "int"
+        },
+        {
+          "Name": "x2",
+          "Type": "int"
+        }
+      ]
+    },
+    {
+      "TableName": "a",
+      "PKeys": [
+        {
+          "Name": "id",
+          "Type": "int"
+        }
+      ],
+      "FKeys": [],
+      "Others": [
+        {
+          "Name": "a1",
+          "Type": "int"
+        },
+        {
+          "Name": "a2",
+          "Type": "int"
+        }
+      ]
+    },
+    {
+      "TableName": "b",
+      "PKeys": [
+        {
+          "Name": "id",
+          "Type": "int"
+        }
+      ],
+      "FKeys": [
+        {
+          "FName": "id",
+          "PName": "id",
+          "PTable": "0"
+        }
+      ],
+      "Others": [
+        {
+          "Name": "b1",
+          "Type": "int"
+        }
+      ]
+    },
+    {
+      "TableName": "c",
+      "PKeys": [
+        {
+          "Name": "id",
+          "Type": "int"
+        }
+      ],
+      "FKeys": [],
+      "Others": [
+        {
+          "Name": "c1",
+          "Type": "int"
+        },
+        {
+          "Name": "c2",
+          "Type": "int"
+        }
+      ]
+    },
+    {
+      "TableName": "d",
+      "PKeys": [
+        {
+          "Name": "id",
+          "Type": "int"
+        }
+      ],
+      "FKeys": [],
+      "Others": [
+        {
+          "Name": "d1",
+          "Type": "int"
+        }
+      ]
+    },
+    {
+      "TableName": "e",
+      "PKeys": [
+        {
+          "Name": "id",
+          "Type": "int"
+        }
+      ],
+      "FKeys": [],
+      "Others": []
+    }
+  ],
+  "Tuples": []
+}

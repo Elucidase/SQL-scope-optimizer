@@ -1,6 +1,7 @@
 import pglast
 from pglast import parser, parse_sql, Missing
 from pglast.visitors import Visitor
+from typing import Dict, Tuple
 
 
 # Assumptions
@@ -9,6 +10,22 @@ from pglast.visitors import Visitor
 # REMEDIABLE: A group by column is exactly of form t.c
 # REMEDIABLE: Sublink yet to be supported
 
+def find_depending_columns(node: pglast.node.Node):
+    """Find all (table, column) in a node, not considering sublink"""
+    class FindColumnVisitor(Visitor):
+        def __init__(self):
+            self.dependsOn = []
+        def visit_ColumnRef(self, _, node):
+            self.dependsOn.append(Column.columnRef_to_exact_inner(pglast.node.Node(node)))
+        def visit_SubLink(self, _, node):
+            return pglast.visitors.Skip()
+    find_column_visitor = FindColumnVisitor()
+    find_column_visitor(node.ast_node)
+    return find_column_visitor.dependsOn
+
+def find_involved_tables(node: pglast.node.Node) -> set:
+    depending_columns = find_depending_columns(node)
+    return set(table_column[0] for table_column in depending_columns)
 
 class Column:
     """
@@ -23,16 +40,6 @@ class Column:
         if self.exact_inner is not None:
             string += f"({self.exact_inner[0]}.{self.exact_inner[1]})" 
         return string
-    
-    def find_depending_columns(self):
-        """Find all ColumnRefs in the column expression
-            Not considering SubLink
-        """
-        dependsOn = []
-        for node in self.val.traverse():
-            if isinstance(node, pglast.node.Node) and node.node_tag == "ColumnRef":
-                dependsOn.append(Column.columnRef_to_exact_inner(node))
-        return dependsOn
     
     @staticmethod
     def create(table_name: str, column: str):
@@ -56,7 +63,7 @@ class Column:
         if node.val.node_tag == "ColumnRef":
             self.exact_inner = Column.columnRef_to_exact_inner(node.val)
         # columns it depends on
-        self.dependsOn = self.find_depending_columns()
+        self.dependsOn = find_depending_columns(node)
         return self
     
     @staticmethod
@@ -109,11 +116,16 @@ class TopLevelAnalyzer:
         center_exact_inner (list): for each group-by column, if column is t.c for some inner table t, then (t, c);
             else if column is a column in SELECT, then alias name; else None
         """
-        self.node = node
-        self.tables = None
-        self.target_columns = None
-        self.center_exact_inner = None
+        self.node: pglast.node.Node = node
+        self.tables: list[str] = None
+        self.target_columns: Dict[str, Column] = None
+        self.center_exact_inner: list[Tuple] = None
         
+    def __call__(self):
+        self.find_top_level_tables()
+        self.find_target_columns()
+        self.find_center_exact_inner()
+                
     def set_top_level_tables(self, top_level_tables):
         self.tables = top_level_tables
         
@@ -152,7 +164,7 @@ class TopLevelAnalyzer:
         return self.target_columns
     
     def find_center_exact_inner(self):
-        """fill in center_exact_inner
+        """fill in center_exact_inner, for select statement with group-by clause
            assume target_columns is filled 
         """
         group_by_columns = self.node.groupClause
@@ -166,7 +178,7 @@ class TopLevelAnalyzer:
             if len(columnRef.fields) == 1:
                 column_name = columnRef.fields[0].val.value
                 if column_name not in self.target_columns:
-                    raise Exception(f"column {column_name} needs to be qualified with table name")
+                    raise Exception(f"column {column_name} not recognized")
                 exact_inner = self.target_columns[column_name].exact_inner
                 exact_inners.append(exact_inner if exact_inner else column_name)
             else:
@@ -197,27 +209,48 @@ class TopLevelAnalyzer:
             if self.node.whereClause is not Missing:
                 replace_visitor(self.node.whereClause.ast_node)
                 
-    def fetchAllPredicates(self):
+    def fetch_all_predicates(self):
         """fetch all predicates present in ON/WHERE clauses"""
-        class PredicateVisitor(Visitor):
-            def __init__(self):
-                self.prediates = []
-            def visit_JoinExpr(self):
-                pass
-        
-            
+        class PredicateFetcher(Visitor):
+            def __init__(self, predicates):
+                self.prediates = predicates
+            def visit_JoinExpr(self, _, node):
+                if node.quals is not None and not isinstance(node.quals, pglast.ast.BoolExpr):
+                    self.prediates.append(node.quals)
+            def visit_BoolExpr(self, _, node):
+                for arg in node.args:
+                    if not isinstance(arg, pglast.ast.BoolExpr):
+                        self.prediates.append(arg)
+            def visit_RangeSubselect(self, _, node):
+                return pglast.visitors.Skip()
+            # do not consider sublink yet
+            def visit_SubLink(self, _, node):
+                return pglast.visitors.Skip()
+        predicates = []
+        predicate_fetcher = PredicateFetcher(predicates)
+        predicate_fetcher(self.node.fromClause[0].ast_node)
+        if self.node.whereClause is not Missing:
+            if self.node.whereClause.node_tag != "BoolExpr":
+                predicates.append(self.node.whereClause.ast_node)
+            else:
+                predicate_fetcher(self.node.whereClause.ast_node)
+        return predicates
+    
+    
     
     
 if __name__ == "__main__":           
     schema_file = "testschema.json"
     # sql = """WITH cte AS (SELECT 1 as cst1, a.a1 as a1 FROM a) SELECT (SELECT 3 FROM d) k2, a2.a + 1 k2 FROM c c2 CROSS JOIN (SELECT * FROM a) as a2 WHERE EXISTS (SELECT 3 FROM d)"""
-    sql = """SELECT a.a1 a1, a.a1 + b.b1 AS sum FROM (a cross join b) left join (SELECT c.c1 FROM c WHERE c.c1 = sum) c0 on sum = c0.c1 where sum < 10"""
+    sql = """SELECT a.a1 a1, a.a1 + b.b1 AS sum FROM (a cross join b) left join (SELECT c.c1 FROM c WHERE c.c1 = sum) c0 on sum = c0.c1 where sum < 10 AND (sum < 9 OR sum < 8)"""
     root = pglast.node.Node(parse_sql(sql))
     node = root[0].stmt
     analyzer = TopLevelAnalyzer(node)
-    analyzer.find_target_columns()
-    analyzer.replace_column_alias_usage()
+    analyzer()
+    # print(analyzer.tables)
     from pglast.stream import RawStream
-    print(RawStream()(node))
+    for predicate in analyzer.fetch_all_predicates():
+        # print(predicate)
+        print(RawStream()(predicate))
 
         

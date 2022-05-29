@@ -13,7 +13,13 @@ AGGREGATE_NAMES = ["count", "sum", "min", "max", "avg"]
 # Assumptions
 # REMEDIABLE: A group by column is exactly of form t.c
 # REMEDIABLE: Sublink yet to be supported
-    
+
+class FullContext:
+    def __init__(self, top_level_tables_inside, columns, unique_column_tuples):
+        self.top_level_tables_inside: Dict[str, list] = top_level_tables_inside
+        self.columns: Dict[str, Dict[str, Column]] = columns
+        self.unique_column_tuples: Dict[str, list] = unique_column_tuples
+
 class FullAnalyzer:
     """
     Attributes:
@@ -22,7 +28,7 @@ class FullAnalyzer:
         columns (Dict[str, Dict[str, Column]]): table name -> dict from column name to Column object
         unique_column_tuples (Dict[str, list]): table name -> list of column names or combination of column names that are unique
         root (pglast.node.Node): root node
-        schema (dict): parsed from json
+        schema (str): json file name
         center_columns (list[list[Tuple[str, str]]]): possibilities for each center column
         holes (list[pglast.node.Node]): hole id -> function_call
     """
@@ -42,6 +48,7 @@ class FullAnalyzer:
         self.fill_columns_dfs(TOP)
         self.find_center_columns()
         self.find_holes()
+        return FullContext(self.top_level_tables_inside, self.columns, self.unique_column_tuples)
 
     def find_hierarchy(self):
         """fill in top_level_tables_inside and table_node"""
@@ -123,6 +130,8 @@ class FullAnalyzer:
            replace SELECT * with actual columns
            qualify columns with the inner tables they come from 
         """
+        if table_name not in self.table_node:
+            raise Exception(f"Table {table_name} can't be resolved. Check schema.")
         node = self.table_node[table_name]
         # Case 1: RangeVar
         if node.node_tag == "RangeVar":
@@ -221,9 +230,8 @@ class FullAnalyzer:
     def fill_unique_column_tuples(self, table_name):
         """helper function of fill_columns_dfs, fill unique_column_tuples for this table"""
         node = self.table_node[table_name]
-        top_level_tables = self.top_level_tables_inside[table_name]
         self.unique_column_tuples[table_name] = []
-        # find all columns that are directly from a children table
+                    # find all columns that are directly from a children table
         inner_columns = {}
         for column_name, column_obj in self.columns[table_name].items():
             if column_obj.exact_inner:
@@ -270,21 +278,37 @@ class FullAnalyzer:
             self.unique_column_tuples[table_name] = [list(self.columns[table_name])]
         else: 
             # nothing to guarentee uniqueness, so we use the cartesian product of child unique tuples
-            cartesian_components = []
-            for table in top_level_tables:
-                tabled_unique_tuples = []
-                for unique_column_tuple in self.unique_column_tuples[table]:
-                    tabled_unique_tuples.append([(table, column) for column in unique_column_tuple])
-                cartesian_components.append(tabled_unique_tuples)
-            # a column tuple that contains a unique column (tuple) for each child table is unique
-            # so we take Cartesian product of the unique column (tuple) of children tables
-            product = itertools.product(*cartesian_components)
-            candidate_tuples = [list(itertools.chain.from_iterable(cols)) for cols in product]
+            candidate_tuples = self.cartesian_of_child_unique_tuples(
+                self.top_level_tables_inside[table_name],
+                self.columns[table_name],
+                self.unique_column_tuples
+            )
             # if a candidate tuple is a subset of what we select, accept it
             for candidate_tuple in candidate_tuples:
                 if all(column in inner_columns for column in candidate_tuple):
                     candidate_tuple = [inner_columns[column] for column in candidate_tuple]
                     self.unique_column_tuples[table_name].append(candidate_tuple)
+    
+    @staticmethod                
+    def cartesian_of_child_unique_tuples(top_level_tables: list, columns: Dict[str, Column], unique_column_tuples: Dict[str, list]):
+        # find all columns we select that are exactly from an inner table
+        inner_columns = {}
+        for column_name, column_obj in columns.items():
+            if column_obj.exact_inner:
+                inner_columns[column_obj.exact_inner] = column_name
+        cartesian_components = []
+        for table in top_level_tables:
+            tabled_unique_tuples = []
+            for unique_column_tuple in unique_column_tuples[table]:
+                tabled_unique_tuples.append([(table, column) for column in unique_column_tuple])
+            cartesian_components.append(tabled_unique_tuples)
+        # a column tuple that contains a unique column (tuple) for each child table is unique
+        # so we take Cartesian product of the unique column (tuple) of children tables
+        product = itertools.product(*cartesian_components)
+        return [list(itertools.chain.from_iterable(cols)) for cols in product]
+        
+
+        return result_unique_column_tuples
                     
     def column_object(self, table_name: str, column_name: str):
         """return Column object for table_name.column_name"""
@@ -354,29 +378,8 @@ class FullAnalyzer:
             
 
 if __name__ == "__main__":           
-    schema_file = "1633schema.json"
-    # sql = """WITH cte AS (SELECT 1 as cst1, a.a1 as a1 FROM a) SELECT (SELECT 3 FROM d) k2, a2.a + 1 k2 FROM c c2 CROSS JOIN (SELECT * FROM a) as a2 WHERE EXISTS (SELECT 3 FROM d)"""
-    sql = """SELECT  t1.contest_id
-       ,round(cast(div((COUNT(t2.user_id)) * 100,COUNT(t1.user_id)) AS numeric),2) AS percentage
-FROM
-(
-	SELECT  *
-	FROM
-	(
-		SELECT  distinct contest_id
-		FROM register
-	) AS co
-	CROSS JOIN
-	(
-		SELECT  distinct user_id
-		FROM users
-	) AS us
-) AS t1
-LEFT JOIN register AS t2
-ON (t1.contest_id = t2.contest_id) AND (t1.user_id = t2.user_id)
-GROUP BY  t1.contest_id
-ORDER BY percentage desc
-         ,t1.contest_id asc"""
+    schema_file = "testschema.json"
+    sql = """WITH cte AS (SELECT 1 as cst1, a.a1 as a1 FROM a) SELECT (SELECT 3 FROM d) k2, a2.a + 1 k2 FROM c c2 CROSS JOIN (SELECT * FROM a) as a2 WHERE EXISTS (SELECT 3 FROM d)"""
     analyzer = FullAnalyzer(sql, schema_file)
     analyzer()
     from pglast.stream import RawStream
