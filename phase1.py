@@ -1,35 +1,61 @@
 import pglast
 from pglast import parser, parse_sql, Missing
 from pglast.visitors import Visitor
-from top_level_analyzer import Column, TopLevelAnalyzer, find_depending_columns, find_involved_tables
+from top_level_analyzer import TopLevelAnalyzer
+from common import find_involved_tables,connected_component_dfs, ast_BoolExpr
 from full_analyzer import FullAnalyzer, FullContext, AGGREGATE_NAMES
-import itertools
-from typing import Dict, Set, Tuple
 from pglast.stream import RawStream
 
 class Phase1:
     def __init__(self, node: pglast.node.Node, context: FullContext):
-        self.node = node
-        self.center_columns = None
-        self.side_tables = None
-        self.clusters = None
-        self.context = context
-        self.analyzer = TopLevelAnalyzer(self.node)
-        self.analyzer()
-        self.analyzer.replace_column_alias_usage()
+        self.node: pglast.node.Node = node
+        self.center_columns: list[tuple(str, str)] = None
+        self.clusters: list[list[str]] = None
+        self.context: FullContext = context
+        self.top_level: TopLevelAnalyzer = TopLevelAnalyzer(self.node)
+        self.top_level()
+        self.top_level.replace_column_alias_usage()
         
         
     def find_center_columns(self):
         """fill in center_columns"""
         if self.node.groupClause is Missing:
             candidates = FullAnalyzer.cartesian_of_child_unique_tuples(
-                self.analyzer.tables,
-                self.analyzer.target_columns,
+                self.top_level.tables,
+                self.top_level.target_columns,
                 context.unique_column_tuples
             )
             self.center_columns = candidates[0] if len(candidates) > 0 else []
         else:
-            self.center_columns = self.analyzer.center_exact_inner
+            self.center_columns = self.top_level.center_exact_inner
+    
+    def fetch_all_predicates(self):
+        """fetch all predicates present in ON/WHERE clauses
+        """
+        class PredicateFetcher(Visitor):
+            def __init__(self, predicates):
+                self.predicates = predicates
+            def visit_JoinExpr(self, _, node):
+                if node.quals is not None and not isinstance(node.quals, pglast.ast.BoolExpr):
+                    self.predicates.append(node.quals)
+            def visit_BoolExpr(self, _, node):
+                for arg in node.args:
+                    if not isinstance(arg, pglast.ast.BoolExpr):
+                        self.predicates.append(arg)
+            def visit_RangeSubselect(self, _, node):
+                return pglast.visitors.Skip()
+            # do not consider sublink yet
+            def visit_SubLink(self, _, node):
+                return pglast.visitors.Skip()
+        predicates = []
+        predicate_fetcher = PredicateFetcher(predicates)
+        predicate_fetcher(self.node.fromClause[0].ast_node)
+        if self.node.whereClause is not Missing:
+            if self.node.whereClause.node_tag != "BoolExpr":
+                predicates.append(self.node.whereClause.ast_node)
+            else:
+                predicate_fetcher(self.node.whereClause.ast_node)
+        return predicates
             
     def find_clusters(self):
         """find clusters
@@ -37,9 +63,9 @@ class Phase1:
            assume center columns is filled
         """
         center_tables = set(table_column[0] for table_column in self.center_columns)
-        side_tables = set(self.analyzer.tables) - center_tables
+        side_tables = set(self.top_level.tables) - center_tables
         edges = {side_table: [] for side_table in side_tables}
-        predicates = self.analyzer.fetch_all_predicates()
+        predicates = self.fetch_all_predicates()
         # construct edges
         for predicate in predicates:
             involved_tables = find_involved_tables(pglast.node.Node(predicate))
@@ -59,9 +85,9 @@ class Phase1:
     def remove_irrelevant_clusters(self):
         """remove tables in irrelevant clusters from Join clause and all related predicates"""
         # only select one hole at a time
-        assert(len(self.analyzer.target_columns) == 1)
-        column = next(iter(self.analyzer.target_columns))
-        column_content = self.analyzer.target_columns[column].val
+        assert(len(self.top_level.target_columns) == 1)
+        column = next(iter(self.top_level.target_columns))
+        column_content = self.top_level.target_columns[column].val
         involved_tables = find_involved_tables(column_content)
         for cluster in self.clusters:
             if any(table in involved_tables for table in cluster):
@@ -72,6 +98,7 @@ class Phase1:
                 self.node.ast_node.whereClause = updated_where_clause
 
     def remove_table_from_join(self, table_name: str):
+        """remove table table_name from JoinExpr in FROM clause"""
         class RemoveTableVisitor(Visitor):
             def __init__(self, table_name):
                 self.table_name = table_name
@@ -95,6 +122,7 @@ class Phase1:
         remove_table_vistor(self.node.ast_node)
     
     def predicates_without_table_dfs(self, node: pglast.node.Node, table_name: str):
+        """return a modified version of node that eliminates all predicates involving table_name"""
         if node is Missing:
             return None
         if isinstance(node, pglast.node.Scalar):
@@ -105,17 +133,12 @@ class Phase1:
         # node is BoolExpr
         args = [self.predicates_without_table_dfs(arg, table_name) for arg in node.args]
         args = [arg for arg in args if arg is not None]
-        if len(args) == 0:
-            return None
-        elif len(args) == 1:
-            NOT_EXPR = pglast.enums.primnodes.BoolExprType.NOT_EXPR
-            if node.boolop.value == NOT_EXPR:
-                return pglast.ast.BoolExpr(NOT_EXPR, args)
-            else:
-                return args[0]
-        return pglast.ast.BoolExpr(node.boolop.value, args)
+        return ast_BoolExpr(node.boolop.value, args)
     
-    def checkIdempotent(self):
+    def check_idempotent(self):
+        """check if the hole is idempotent, i.e. return same thing regardless of whether there is only one
+           or more than one rows with same value in the fields it involves
+        """
         funcCall = self.node.targetList[0].val
         assert(funcCall.node_tag == "FuncCall")
         assert(funcCall.funcname[0].val.value in AGGREGATE_NAMES)
@@ -128,14 +151,6 @@ class Phase1:
                 irrelevant_cluster += 1
         return irrelevant_cluster == 0
         
-        
-        
-def connected_component_dfs(vertex, edges: Dict[str, list], visited: Set, component: list):
-    visited.add(vertex)
-    component.append(vertex)
-    for next in edges[vertex]:
-        if next not in visited:
-            connected_component_dfs(next, edges, visited, component)
 
 if __name__ == "__main__":      
     schema_file = "phase1schema.json"
@@ -169,4 +184,4 @@ if __name__ == "__main__":
     print("before", RawStream()(phase1.node))
     phase1.remove_irrelevant_clusters()
     print("after", RawStream()(phase1.node))
-    print(phase1.checkIdempotent())
+    print(phase1.check_idempotent())

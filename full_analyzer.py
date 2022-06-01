@@ -1,11 +1,11 @@
 import itertools
-import copy
 from typing import Dict, Tuple
 import pglast
 from pglast import parser, parse_sql, Missing
 from pglast.visitors import Visitor
 import json
-from top_level_analyzer import Column, TopLevelAnalyzer
+from common import Column, FullContext
+from top_level_analyzer import TopLevelAnalyzer
 
 TOP = "%top%"
 AGGREGATE_NAMES = ["count", "sum", "min", "max", "avg"]
@@ -13,12 +13,6 @@ AGGREGATE_NAMES = ["count", "sum", "min", "max", "avg"]
 # Assumptions
 # REMEDIABLE: A group by column is exactly of form t.c
 # REMEDIABLE: Sublink yet to be supported
-
-class FullContext:
-    def __init__(self, top_level_tables_inside, columns, unique_column_tuples):
-        self.top_level_tables_inside: Dict[str, list] = top_level_tables_inside
-        self.columns: Dict[str, Dict[str, Column]] = columns
-        self.unique_column_tuples: Dict[str, list] = unique_column_tuples
 
 class FullAnalyzer:
     """
