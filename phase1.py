@@ -7,19 +7,22 @@ from full_analyzer import FullAnalyzer, FullContext, AGGREGATE_NAMES
 from pglast.stream import RawStream
 
 class Phase1:
-    def __init__(self, node: pglast.node.Node, context: FullContext):
-        self.node: pglast.node.Node = node
+    def __init__(self, node: pglast.ast.Node, context: FullContext):
+        if not isinstance(node, pglast.ast.Node):
+            raise Exception("ToplevelAnalyzer accepts ast.Node, not node.Node")
+        self.node: pglast.ast.Node = node
         self.center_columns: list[tuple(str, str)] = None
         self.clusters: list[list[str]] = None
         self.context: FullContext = context
         self.top_level: TopLevelAnalyzer = TopLevelAnalyzer(self.node)
+        # init
         self.top_level()
         self.top_level.replace_column_alias_usage()
         
         
     def find_center_columns(self):
         """fill in center_columns"""
-        if self.node.groupClause is Missing:
+        if self.node.groupClause is None:
             candidates = FullAnalyzer.cartesian_of_child_unique_tuples(
                 self.top_level.tables,
                 self.top_level.target_columns,
@@ -27,7 +30,7 @@ class Phase1:
             )
             self.center_columns = candidates[0] if len(candidates) > 0 else []
         else:
-            self.center_columns = self.top_level.center_exact_inner
+            self.center_columns = [group_column.exact_inner for group_column in self.top_level.group_columns]
     
     def fetch_all_predicates(self):
         """fetch all predicates present in ON/WHERE clauses
@@ -49,12 +52,12 @@ class Phase1:
                 return pglast.visitors.Skip()
         predicates = []
         predicate_fetcher = PredicateFetcher(predicates)
-        predicate_fetcher(self.node.fromClause[0].ast_node)
-        if self.node.whereClause is not Missing:
-            if self.node.whereClause.node_tag != "BoolExpr":
-                predicates.append(self.node.whereClause.ast_node)
+        predicate_fetcher(self.node.fromClause[0])
+        if self.node.whereClause is not None:
+            if not isinstance(self.node.whereClause, pglast.ast.BoolExpr):
+                predicates.append(self.node.whereClause)
             else:
-                predicate_fetcher(self.node.whereClause.ast_node)
+                predicate_fetcher(self.node.whereClause)
         return predicates
             
     def find_clusters(self):
@@ -68,7 +71,7 @@ class Phase1:
         predicates = self.fetch_all_predicates()
         # construct edges
         for predicate in predicates:
-            involved_tables = find_involved_tables(pglast.node.Node(predicate))
+            involved_tables = find_involved_tables(predicate)
             involved_tables -= center_tables
             for table in involved_tables:
                 edges[table].extend(involved_tables - set([table]))
@@ -95,7 +98,7 @@ class Phase1:
             for table_name in cluster:
                 self.remove_table_from_join(table_name)
                 updated_where_clause = self.predicates_without_table_dfs(self.node.whereClause, table_name)
-                self.node.ast_node.whereClause = updated_where_clause
+                self.node.whereClause = updated_where_clause
 
     def remove_table_from_join(self, table_name: str):
         """remove table table_name from JoinExpr in FROM clause"""
@@ -119,19 +122,20 @@ class Phase1:
             def visit_SubLink(self, _, node):
                 return pglast.visitors.Skip()
         remove_table_vistor = RemoveTableVisitor(table_name)
-        remove_table_vistor(self.node.ast_node)
+        remove_table_vistor(self.node)
     
-    def predicates_without_table_dfs(self, node: pglast.node.Node, table_name: str):
+    def predicates_without_table_dfs(self, node: pglast.ast.Node, table_name: str):
         """return a modified version of node that eliminates all predicates involving table_name"""
+        node = pglast.node.Node(node)
         if node is Missing:
             return None
         if isinstance(node, pglast.node.Scalar):
             return node.value
         if node.node_tag != "BoolExpr":
-            involved_tables = find_involved_tables(node)
+            involved_tables = find_involved_tables(node.ast_node)
             return None if table_name in involved_tables else node.ast_node
         # node is BoolExpr
-        args = [self.predicates_without_table_dfs(arg, table_name) for arg in node.args]
+        args = [self.predicates_without_table_dfs(arg.ast_node, table_name) for arg in node.args]
         args = [arg for arg in args if arg is not None]
         return ast_BoolExpr(node.boolop.value, args)
     
@@ -140,8 +144,8 @@ class Phase1:
            or more than one rows with same value in the fields it involves
         """
         funcCall = self.node.targetList[0].val
-        assert(funcCall.node_tag == "FuncCall")
-        assert(funcCall.funcname[0].val.value in AGGREGATE_NAMES)
+        assert(isinstance(funcCall, pglast.ast.FuncCall))
+        assert(funcCall.funcname[0].val in AGGREGATE_NAMES)
         if funcCall.agg_distinct:
             return True
         involved_tables = find_involved_tables(node)
@@ -177,7 +181,7 @@ if __name__ == "__main__":
     full_analyzer = FullAnalyzer(sql, schema_file)
     context = full_analyzer()
 
-    phase1 = Phase1(node, context)
+    phase1 = Phase1(node.ast_node, context)
     phase1.find_center_columns()
     phase1.find_clusters()
     print(phase1.center_columns, phase1.clusters)

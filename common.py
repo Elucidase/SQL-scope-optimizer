@@ -1,17 +1,18 @@
-from numpy import isin
 import pglast
 from pglast.enums.primnodes import BoolExprType
 from pglast.visitors import Visitor
 from pglast import Missing
 from typing import Dict, Set, List
+from pglast.stream import RawStream
 
 class Column:
     """
     Attributes:
         name: column name
-        val: expression for the column
+        val: pglast.ast.Node expression for the column
         exact_inner: (table, name) if the column is exactly table.name where table is in a smaller scope; otherwise None
         dependsOn: list of columns this column depends on
+        text_form: plain text representation used to check if two columns are obviously equal
     """
     def __repr__(self):
         string = self.name
@@ -19,41 +20,43 @@ class Column:
             string += f"({self.exact_inner[0]}.{self.exact_inner[1]})" 
         return string
     
-    @staticmethod
-    def create(table_name: str, column: str):
+    @classmethod
+    def create(cls, table_name: str, column: str):
         """Create a Column from table.column"""
-        self = Column()
+        self = cls()
         self.name = column
         self.val = pglast.ast.ColumnRef(
             [pglast.ast.String(table_name), pglast.ast.String(column)]
         )
         self.exact_inner = (table_name, column)
         self.dependsOn = [self.exact_inner]
+        self.text_form = RawStream()(self.val)
         return self
     
-    @staticmethod
-    def fromResTarget(node: pglast.node.Node):
+    @classmethod
+    def from_ast_node(cls, ast_node: pglast.ast.Node, name: str):
         """Takes in a ResTarget"""
-        self = Column()
-        self.name = Column.resTarget_columnRef_name(node)
-        self.val = node.val
+        self = cls()
+        self.name = name
+        self.val = ast_node
         self.exact_inner = None
-        if node.val.node_tag == "ColumnRef":
-            self.exact_inner = Column.columnRef_to_exact_inner(node.val)
+        if isinstance(ast_node, pglast.ast.ColumnRef):
+            self.exact_inner = cls.columnRef_to_exact_inner(ast_node)
         # columns it depends on
-        self.dependsOn = find_depending_columns(node)
+        self.dependsOn = find_depending_columns(ast_node)
+        self.text_form = RawStream()(self.val)
         return self
     
     @staticmethod
-    def resTarget_columnRef_name(target: pglast.node.Node):
+    def name_from_resTarget(target: pglast.ast.ResTarget):
         """Find name of column from ResTarget whose val is ColumnRef"""
-        if target.name is Missing:
-            if target.val.node_tag == "ColumnRef":
-                return target.val.fields[-1].val.value
+        if target.name is None:
+            if isinstance(target.val, pglast.ast.ColumnRef):
+                return target.val.fields[-1].val
             else:
-                raise Exception(f"Please add alias to column {target.val.ast_node}")
+                raise Exception(f"Please add alias to column {target.val}")
         else:
-            return target.name.value
+            return target.name
         
     @staticmethod
     def name_to_resTarget(table_name: str, column_name: str):
@@ -63,13 +66,13 @@ class Column:
          
     
     @staticmethod
-    def columnRef_to_exact_inner(node: pglast.node.Node):
+    def columnRef_to_exact_inner(columnRef: pglast.ast.ColumnRef):
         """Convert ColumnRef to (table, column)"""
-        fields = node.fields
-        if len(fields) < 2:
-            raise Exception(f"column {fields[-1].val.value} need to be qualified with its table name")
+        fields = columnRef.fields
+        if len(fields) == 1:
+            return fields[0].val
         else:
-            return (fields[0].val.value, fields[1].val.value)
+            return (fields[0].val, fields[1].val)
         
         
     @staticmethod
@@ -97,23 +100,21 @@ class Counter:
         self.counter += 1
         return self.counter
 
-def find_depending_columns(node: pglast.node.Node):
+def find_depending_columns(ast_node: pglast.ast.Node):
     """Find all (table, column) in a node, not considering sublink"""
     class FindColumnVisitor(Visitor):
         def __init__(self):
             self.dependsOn = []
         def visit_ColumnRef(self, _, node):
-            self.dependsOn.append(Column.columnRef_to_exact_inner(pglast.node.Node(node)))
+            self.dependsOn.append(Column.columnRef_to_exact_inner(node))
         def visit_SubLink(self, _, node):
             return pglast.visitors.Skip()
     find_column_visitor = FindColumnVisitor()
-    find_column_visitor(node.ast_node)
+    find_column_visitor(ast_node)
     return find_column_visitor.dependsOn
 
-def find_involved_tables(node: pglast.node.Node) -> set:
-    if not isinstance(node, pglast.node.Node):
-        raise Exception("find_involve_table requires pglast.node.Node. Check if you passed in pglast.ast.Node.")
-    depending_columns = find_depending_columns(node)
+def find_involved_tables(ast_node: pglast.ast.Node) -> set:
+    depending_columns = find_depending_columns(ast_node)
     return set(table_column[0] for table_column in depending_columns)
         
 def connected_component_dfs(vertex, edges: Dict[str, list], visited: Set, component: list):
@@ -123,12 +124,16 @@ def connected_component_dfs(vertex, edges: Dict[str, list], visited: Set, compon
         if next not in visited:
             connected_component_dfs(next, edges, visited, component)
             
-def strongly_connected_components(edges):
-    # find reverse graph
+def reversed_graph(edges):
     edges_rev = {vertex: [] for vertex in edges}
     for vertex, to_list in edges.items():
         for to_vertex in to_list:
             edges_rev[to_vertex].append(vertex)
+    return edges_rev
+    
+def strongly_connected_components(edges):
+    # find reverse graph
+    edges_rev = reversed_graph(edges)
     visited = set()
     topo_sort_order = []
     components = []
@@ -197,12 +202,12 @@ def check_null_sensitive_dfs(node: pglast.node.Base):
     # anything else is False to be safe
     return False
         
-def decompose_predicate(node: pglast.node.Node):
+def decompose_predicate(node: pglast.ast.Node):
     """decompose a predicate into a list of predicates that do not contain AND/OR/NOT"""
-    if node is Missing:
+    if node is None:
         return []
-    if node.node_tag != "BoolExpr":
-        return [node.ast_node]
+    if not isinstance(node, pglast.ast.BoolExpr):
+        return [node]
     class DecomposeVisitor(Visitor):
         def __init__(self):
             self.predicates = []
@@ -214,6 +219,5 @@ def decompose_predicate(node: pglast.node.Node):
         def visit_SubLink(self, _, node):
             return pglast.visitors.Skip()
     decompose_visitor = DecomposeVisitor()
-    decompose_visitor(node.ast_node)
+    decompose_visitor(node)
     return decompose_visitor.predicates
-    

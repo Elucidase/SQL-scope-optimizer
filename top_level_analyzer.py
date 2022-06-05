@@ -1,36 +1,37 @@
+from copy import deepcopy
 import pglast
-from pglast import parser, parse_sql, Missing
+from pglast import parse_sql
 from pglast.visitors import Visitor
 from typing import Dict, Tuple
 from pglast.enums.nodes import JoinType
-from common import Column, check_null_sensitive_dfs, find_involved_tables, decompose_predicate, strongly_connected_components
+from common import Column, check_null_sensitive_dfs, find_involved_tables, decompose_predicate, reversed_graph
 
 
 # Assumptions
-# SAFE: A column, when used, is table-qualified (i.e t.c) unless referring to an alias of a column in the current scope
-# SAFT: A column, when declared in SELECT clause, has an alias unless it is exactly of form t.c
-# REMEDIABLE: A group by column is exactly of form t.c
 # REMEDIABLE: Sublink yet to be supported
     
 class TopLevelAnalyzer:
-    def __init__(self, node: pglast.node.Node):
+    def __init__(self, node: pglast.ast.Node):
         """
         Attributes:
-        node (pglast.node.Node): current node
+        node (pglast.ast.Node): current node
         tables (list[str]): list of top-level table names
         target_columns: dict: column_name -> Column object for those declared in SELECT
         center_exact_inner (list): for each group-by column, if column is t.c for some inner table t, then (t, c);
             else if column is a column in SELECT, then alias name; else None
         """
-        self.node: pglast.node.Node = node
+        if not isinstance(node, pglast.ast.Node):
+            raise Exception("ToplevelAnalyzer accepts ast.Node, not node.Node")
+        self.node: pglast.ast.Node = node
         self.tables: list[str] = None
         self.target_columns: Dict[str, Column] = None
-        self.center_exact_inner: list[Tuple] = None
+        self.group_columns: list[Column] = None
         
     def __call__(self):
         self.find_top_level_tables()
         self.find_target_columns()
-        self.find_center_exact_inner()
+        self.find_group_columns()
+        
                 
     def set_top_level_tables(self, top_level_tables):
         self.tables = top_level_tables
@@ -39,7 +40,7 @@ class TopLevelAnalyzer:
         self.target_columns = target_columns
     
     def find_top_level_tables(self):
-        # fill_in top_level_tables
+        """fill_in top_level_tables"""
         class TopLevelTableVisitor(Visitor):
             def __init__(self):
                 self.top_level_tables = []
@@ -53,7 +54,7 @@ class TopLevelAnalyzer:
             def visit_SubLink(self):
                 return pglast.visitors.Skip()
         visitor = TopLevelTableVisitor()
-        visitor(self.node.ast_node)
+        visitor(self.node)
         self.tables = visitor.top_level_tables
         return self.tables
     
@@ -64,33 +65,37 @@ class TopLevelAnalyzer:
         result = {}
         # Assume after FullAnalyzer, there's no SELECT *
         for target in self.node.targetList:
-            column_name = Column.resTarget_columnRef_name(target)
-            result[column_name] = Column.fromResTarget(target)
+            column_name = Column.name_from_resTarget(target)
+            result[column_name] = Column.from_ast_node(target.val, column_name)
         self.target_columns = result
         return self.target_columns
     
-    def find_center_exact_inner(self):
+    def find_group_columns(self):
         """fill in center_exact_inner, for select statement with group-by clause
            assume target_columns is filled 
         """
+        self.group_columns = []
+        if self.node.groupClause is None:
+            return
         group_by_columns = self.node.groupClause
-        exact_inners = []
         # assume each group by column is either t.c or the name of a column in select clause
-        for columnRef in group_by_columns:
-            if columnRef.node_tag != "ColumnRef":
-                print(f"Warning: GROUP BY complex expression ({columnRef}) not yet supported")
-                exact_inners.append(None)
-                continue
-            if len(columnRef.fields) == 1:
-                column_name = columnRef.fields[0].val.value
-                if column_name not in self.target_columns:
-                    raise Exception(f"column {column_name} not recognized")
-                exact_inner = self.target_columns[column_name].exact_inner
-                exact_inners.append(exact_inner if exact_inner else column_name)
-            else:
-                exact_inners.append(Column.columnRef_to_exact_inner(columnRef))
-        self.center_exact_inner = exact_inners
-        return self.center_exact_inner
+        for ast_node in group_by_columns:
+            group_column = Column.from_ast_node(ast_node, "")
+            # check content to see this group-by column is a select column
+            if group_column.exact_inner is None:
+                for target_name, target_column in self.target_columns.items():
+                    if group_column.text_form == target_column.text_form:
+                        group_column.exact_inner = target_name
+                        break
+            # if this group-by column is a select column, check if the select column has exact_inner
+            if isinstance(group_column.exact_inner, str):
+                if group_column.exact_inner not in self.target_columns:
+                    raise Exception(f"Can't recognize column {group_column.exact_inner}")
+                target_exact_inner = self.target_columns[group_column.exact_inner].exact_inner
+                if target_exact_inner is not None:
+                    group_column.exact_inner = target_exact_inner
+            self.group_columns.append(group_column)
+        return self.group_columns
     
     def replace_column_alias_usage(self):
         """replace each reference to a column alias (defined in SELECT clause) in an ON/WHERE clause with actual content
@@ -110,13 +115,13 @@ class TopLevelAnalyzer:
             def visit_SubLink(self, _, node):
                 return pglast.visitors.Skip() 
         for column_name, column_obj in self.target_columns.items():
-            replace_visitor = ReplaceVisitor(column_name, column_obj.val.ast_node)
-            replace_visitor(self.node.fromClause[0].ast_node)
-            if self.node.whereClause is not Missing:
-                replace_visitor(self.node.whereClause.ast_node)
+            replace_visitor = ReplaceVisitor(column_name, column_obj.val)
+            replace_visitor(self.node.fromClause[0])
+            if self.node.whereClause is not None:
+                replace_visitor(self.node.whereClause)
     
-    def find_safe_child_tables(self):
-        """find null-clusters
+    def find_null_graph_and_safety(self):
+        """find null-graph
            Assume no raw table contains a record with NULL in all its fields,
            so if a record of an intermediate table has NULL in all fields of a relation, 
            it must be due to LEFT/RIGHT/OUTER Joins.
@@ -125,12 +130,14 @@ class TopLevelAnalyzer:
            intermediate table can have NULL in all fields belonging to this child table.
            We say there is a "null-edge" from table a to table b iff, 
            all ta fields are null implies all tb fields are NULL.
-           A "null-cluster" is a strongly connected component in the graph constructed.
-           We have the following:
-           1. If there is a null-sensitive predicate in WHERE clause involving a child
-           table, then this child table is safe. 
-           2. If a child table is safe, all other child tables in the same null-cluster
-           are also safe.
+           1. If there is a null-sensitive predicate in WHERE clause or ON clause of an
+           INNER JOIN involving a child table, then this child table is safe. 
+           2. If there is a null edge from child table ta to child table tb and tb is safe,
+           then ta is also safe. Specifically, tables in a null-cluster are either all 
+           safe or all unsafe. 
+           3. If we view joins as a binary tree, then given a safe table (leaf), the join
+           each of its ancestors (including itself) participates in can be transformed to an
+           LEFT or INNER JOIN where the said ancestor acts as the left side of the join. 
         """
         edges = {table: [] for table in self.tables}
         safety = self.construct_null_edges_from_join_dfs(self.node.fromClause[0], edges)
@@ -139,31 +146,44 @@ class TopLevelAnalyzer:
         for predicate in predicates:
             if not check_null_sensitive_dfs(pglast.node.Node(predicate)):
                 continue
-            involved_tables = find_involved_tables(pglast.node.Node(predicate))
+            involved_tables = find_involved_tables(predicate)
             # construct edges in both directions
             for table in involved_tables:
                 safety[table] = True
                 edges[table].extend(involved_tables - set([table]))
-        # construct null-clusters
-        components = strongly_connected_components(edges)
-        safe_child_tables = []
-        for component in components:
-            if any(safety[table] for table in component):
-                safe_child_tables.extend(component)
-        return safe_child_tables  
+        TopLevelAnalyzer.populate_safety(edges, safety)
+        return edges, safety
+    
+    @staticmethod
+    def populate_safety(edges, safety):
+        """infer more tables to be safe"""
+        edges_reversed = reversed_graph(edges)
+        visited = set()
+        def populate_safety_dfs(vertex):
+            visited.add(vertex)
+            safety[vertex] = True
+            for to_vertex in edges_reversed[vertex]:
+                if to_vertex not in visited:
+                    populate_safety_dfs(to_vertex)
+        for table in edges_reversed:
+            if safety[table] and table not in visited:
+                populate_safety_dfs(table)
+            
+        
+        
 
     @staticmethod
-    def construct_null_edges_from_join_dfs(node: pglast.node.Node, edges: Dict[str, list]):
+    def construct_null_edges_from_join_dfs(node: pglast.ast.Node, edges: Dict[str, list]):
         """add edges by examining ON predicates
            returns dict of table_name -> whether it is safe
         """
-        if node.node_tag == "RangeVar":
-            table_name = node.alias.aliasname.value if node.alias else node.relname.value
+        if isinstance(node, pglast.ast.RangeVar):
+            table_name = node.alias.aliasname if node.alias else node.relname
             return {table_name: True}
-        elif node.node_tag == "RangeSubselect":
-            table_name = node.alias.aliasname.value
+        elif isinstance(node, pglast.ast.RangeSubselect):
+            table_name = node.alias.aliasname
             return {table_name: True}
-        assert(node.node_tag == "JoinExpr")
+        assert(isinstance(node, pglast.ast.JoinExpr))
         left_safety = TopLevelAnalyzer.construct_null_edges_from_join_dfs(node.larg, edges)
         right_safety = TopLevelAnalyzer.construct_null_edges_from_join_dfs(node.rarg, edges)
         safety = {**left_safety, **right_safety}
@@ -175,7 +195,7 @@ class TopLevelAnalyzer:
             for table in left_safety:
                 safety[table] = False
         # null-sensitive predicate in ON can help with null-graph and safety
-        if node.quals is Missing or not check_null_sensitive_dfs(node.quals):
+        if node.quals is None or not check_null_sensitive_dfs(pglast.node.Node(node.quals)):
             return safety
         involved_tables = find_involved_tables(node.quals)
         left_involved = [table for table in involved_tables if table in left_safety]
@@ -188,12 +208,8 @@ class TopLevelAnalyzer:
             for table in right_involved:
                 edges[table].extend(left_safety)
         if node.jointype is JoinType.JOIN_INNER:
-            if all(safety[table] for table in left_involved):
-                for table in right_involved:
-                    safety[table] = True
-            if all(safety[table] for table in right_involved):
-                for table in left_involved:
-                    safety[table] = True
+            for table in involved_tables:
+                safety[table] = True
         return safety
                     
     
@@ -218,10 +234,10 @@ if __name__ == "__main__":
     #         WHERE B.b1 >= A.a2 AND (A.a1 < A.a1 OR I.x2 < C.c1) OR NOT(D.d1 = C.c2 AND 1 AND B.id < 1 AND E.id = D.id)
     root = pglast.node.Node(parse_sql(sql))
     node = root[0].stmt
-    analyzer = TopLevelAnalyzer(node)
+    analyzer = TopLevelAnalyzer(node.ast_node)
     analyzer()
     analyzer.replace_column_alias_usage()
-    safe_child_tables = analyzer.find_safe_child_tables()
-    print(safe_child_tables)
+    edges, safety = analyzer.find_null_graph_and_safety()
+    print(edges, safety)
 
         

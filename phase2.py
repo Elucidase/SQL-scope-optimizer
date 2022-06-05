@@ -2,6 +2,7 @@ import pglast
 from pglast import parser, parse_sql, Missing
 from pglast.visitors import Visitor
 from pglast.enums.primnodes import BoolExprType
+from pglast.enums.parsenodes import A_Expr_Kind
 from top_level_analyzer import TopLevelAnalyzer
 from full_analyzer import FullAnalyzer, FullContext
 from typing import Dict, Set, Tuple, List
@@ -13,8 +14,10 @@ import z3
 
 
 class Phase2:
-    def __init__(self, node: pglast.node.Node, context: FullContext, center_columns: list):
-        self.node: pglast.node.Node = node
+    def __init__(self, node: pglast.ast.Node, context: FullContext, center_columns: list):
+        if not isinstance(node, pglast.ast.Node):
+            raise Exception("ToplevelAnalyzer accepts ast.Node, not node.Node")
+        self.node: pglast.ast.Node = node
         self.context: FullContext = context
         self.top_level: TopLevelAnalyzer = TopLevelAnalyzer(node)
         self.center_columns: list[tuple(str, str)] = center_columns
@@ -50,23 +53,23 @@ class Phase2:
         """replace expr BETWEEN lower AND higher to expr >= lower AND expr <= higher"""
         class BetweenAndVisitor(Visitor):
             def visit_A_Expr(self, _, node):
-                if node.kind is not pglast.enums.parsenodes.A_Expr_Kind.AEXPR_BETWEEN and \
-                    node.kind is not pglast.enums.parsenodes.A_Expr_Kind.AEXPR_NOT_BETWEEN:
+                if node.kind is not A_Expr_Kind.AEXPR_BETWEEN and \
+                    node.kind is not A_Expr_Kind.AEXPR_NOT_BETWEEN:
                     return None
                 geq_node = pglast.ast.A_Expr(
-                    kind = pglast.enums.parsenodes.A_Expr_Kind.AEXPR_OP,
+                    kind = A_Expr_Kind.AEXPR_OP,
                     name = (pglast.ast.String(">="),),
                     lexpr = node.lexpr,
                     rexpr = node.rexpr[0]
                 )
                 leq_node  = pglast.ast.A_Expr(
-                    kind = pglast.enums.parsenodes.A_Expr_Kind.AEXPR_OP,
+                    kind = A_Expr_Kind.AEXPR_OP,
                     name = (pglast.ast.String("<="),),
                     lexpr = node.lexpr,
                     rexpr = node.rexpr[1]
                 )
                 new_ast_node = pglast.ast.BoolExpr(BoolExprType.AND_EXPR, [geq_node, leq_node])
-                if node.kind is pglast.enums.parsenodes.A_Expr_Kind.AEXPR_NOT_BETWEEN:
+                if node.kind is A_Expr_Kind.AEXPR_NOT_BETWEEN:
                     new_ast_node = pglast.ast.BoolExpr(BoolExprType.NOT_EXPR, [new_ast_node])
                 return new_ast_node
                     
@@ -76,7 +79,7 @@ class Phase2:
             def visit_SubLink(self, _, node):
                 return pglast.visitors.Skip()    
         between_and_visitor = BetweenAndVisitor()
-        between_and_visitor(self.node.ast_node)
+        between_and_visitor(self.node)
     
     def expand_crossing_case_when(self):
         """For each CASE WHEN, if it crosses, i.e. involves both outer table(s) and inner table(s),
@@ -133,8 +136,8 @@ class Phase2:
                     updated_list[last_step] = replacement
                     setattr(node, second_last_step, updated_list)
             
-        visitor = ExpandCaseWhenVisitor(self.node.ast_node, self.check_crosses)
-        visitor(self.node.ast_node)
+        visitor = ExpandCaseWhenVisitor(self.node, self.check_crosses)
+        visitor(self.node)
         branches = []
         for root, branch_conditions in visitor.branches:
             copied_root = deepcopy(root)
@@ -205,10 +208,10 @@ class Phase2:
         """Add all predicates appearing in ON clause to WHERE clause
            Incur penalty when doing so is not safe
         """
-        top_level = TopLevelAnalyzer(pglast.node.Node(root))
+        top_level = TopLevelAnalyzer(root)
         top_level()
         top_level.replace_column_alias_usage()
-        safe_child_tables = top_level.find_safe_child_tables()
+        _, safety = top_level.find_null_graph_and_safety()
         # fetch all predicates in "ON" clause
         class OnPredicateFetcher(Visitor):
             def __init__(self):
@@ -228,8 +231,8 @@ class Phase2:
         # if not all tables involved in an on-predicate are safe, impose penalty
         penalty = 0
         for predicate in on_predicates:
-            involved_tables = set(find_involved_tables(pglast.node.Node(predicate)))
-            if any(table not in safe_child_tables for table in involved_tables):
+            involved_tables = set(find_involved_tables(predicate))
+            if any(safety[table] == False for table in involved_tables):
                 penalty += 1
         add_predicates_to_where(root, on_predicates)
         return penalty
@@ -258,7 +261,7 @@ ORDER BY num_points DESC
     full_analyzer = FullAnalyzer(sql2, schema_file)
     context = full_analyzer()
     full_analyzer()
-    phase2 = Phase2(node, context, ['t'])
+    phase2 = Phase2(node.ast_node, context, ['t'])
     phase2.find_outer_table()
     case_branches = phase2.expand_crossing_case_when()
     print("Case branches")

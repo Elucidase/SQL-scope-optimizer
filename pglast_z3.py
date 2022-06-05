@@ -1,6 +1,7 @@
 import pglast
 import z3
 from pglast.enums.primnodes import BoolExprType
+from pglast.enums.parsenodes import A_Expr_Kind
 from typing import Dict, List
 from pglast.stream import RawStream
 from common import Counter
@@ -60,7 +61,7 @@ def construct_formula_dfs(expr: pglast.ast.Node, expected_type: type, vars: Dict
     elif isinstance(expr, pglast.ast.ColumnRef):
         return register_new_var(expr, int, vars, var_strings, counter), int
     elif isinstance(expr, pglast.ast.A_Expr):
-        if expr.kind == pglast.enums.parsenodes.A_Expr_Kind.AEXPR_OP:
+        if expr.kind == A_Expr_Kind.AEXPR_OP:
             op = expr.name[0].val
             if op == "=":
                 op = "=="
@@ -141,7 +142,7 @@ def construct_ast_node_from_formula_dfs(formula: z3.BoolRef, vars: Dict[str, Var
         # op is one of the comparison or mathematical operators
         assert(len(child_nodes) in (1, 2))
         ast_node = pglast.ast.A_Expr(
-            kind=pglast.enums.parsenodes.A_Expr_Kind.AEXPR_OP,
+            kind=A_Expr_Kind.AEXPR_OP,
             name=(pglast.ast.String(name),),
             rexpr=child_nodes[-1]
         )
