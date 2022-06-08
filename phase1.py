@@ -1,53 +1,60 @@
+from copy import deepcopy
+from tokenize import group
 import pglast
 from pglast import parser, parse_sql, Missing
 from pglast.visitors import Visitor
 from top_level_analyzer import TopLevelAnalyzer
-from common import find_involved_tables,connected_component_dfs, ast_BoolExpr
-from full_analyzer import FullAnalyzer, FullContext, AGGREGATE_NAMES
+from common import Column, find_involved_tables, connected_component_dfs, ast_BoolExpr, FullContext, AGGREGATE_NAMES, TOP
+from full_analyzer import FullAnalyzer
 from pglast.stream import RawStream
+from typing import Dict
+
 
 class Phase1:
     def __init__(self, node: pglast.ast.Node, context: FullContext):
         if not isinstance(node, pglast.ast.Node):
             raise Exception("ToplevelAnalyzer accepts ast.Node, not node.Node")
         self.node: pglast.ast.Node = node
-        self.center_columns: list[tuple(str, str)] = None
-        self.clusters: list[list[str]] = None
         self.context: FullContext = context
         self.top_level: TopLevelAnalyzer = TopLevelAnalyzer(self.node)
+        self.center_tables: list[str] = None
+        self.clusters: list[list[str]] = None
+        self.relevant_clusters: list[list[str]] = None
         # init
         self.top_level()
         self.top_level.replace_column_alias_usage()
-        
-        
-    def find_center_columns(self):
-        """fill in center_columns"""
+
+    def find_center_tables(self):
+        """fill in center_tables"""
         if self.node.groupClause is None:
-            candidates = FullAnalyzer.cartesian_of_child_unique_tuples(
-                self.top_level.tables,
-                self.top_level.target_columns,
-                context.unique_column_tuples
-            )
-            self.center_columns = candidates[0] if len(candidates) > 0 else []
+            self.center_tables = self.top_level.tables
         else:
-            self.center_columns = [group_column.exact_inner for group_column in self.top_level.group_columns]
-    
+            center_tables = set()
+            for group_column in self.top_level.group_columns:
+                for table, column in group_column.dependsOn:
+                    center_tables.add(table)
+            self.center_tables = list(center_tables)
+
     def fetch_all_predicates(self):
         """fetch all predicates present in ON/WHERE clauses
         """
         class PredicateFetcher(Visitor):
             def __init__(self, predicates):
                 self.predicates = predicates
+
             def visit_JoinExpr(self, _, node):
                 if node.quals is not None and not isinstance(node.quals, pglast.ast.BoolExpr):
                     self.predicates.append(node.quals)
+
             def visit_BoolExpr(self, _, node):
                 for arg in node.args:
                     if not isinstance(arg, pglast.ast.BoolExpr):
                         self.predicates.append(arg)
+
             def visit_RangeSubselect(self, _, node):
                 return pglast.visitors.Skip()
             # do not consider sublink yet
+
             def visit_SubLink(self, _, node):
                 return pglast.visitors.Skip()
         predicates = []
@@ -59,13 +66,13 @@ class Phase1:
             else:
                 predicate_fetcher(self.node.whereClause)
         return predicates
-            
+
     def find_clusters(self):
         """find clusters
            two side tables are in the same cluster iff there is a predicate that involve both
            assume center columns is filled
         """
-        center_tables = set(table_column[0] for table_column in self.center_columns)
+        center_tables = set(self.center_tables)
         side_tables = set(self.top_level.tables) - center_tables
         edges = {side_table: [] for side_table in side_tables}
         predicates = self.fetch_all_predicates()
@@ -84,20 +91,24 @@ class Phase1:
                 connected_component_dfs(table, edges, visited, cluster)
                 clusters.append(cluster)
         self.clusters = clusters
-        
+
     def remove_irrelevant_clusters(self):
-        """remove tables in irrelevant clusters from Join clause and all related predicates"""
+        """remove tables in irrelevant clusters from Join clause and all related predicates
+           calculate self.relevant_clusters
+        """
         # only select one hole at a time
         assert(len(self.top_level.target_columns) == 1)
         column = next(iter(self.top_level.target_columns))
         column_content = self.top_level.target_columns[column].val
         involved_tables = find_involved_tables(column_content)
+        self.relevant_clusters = []
         for cluster in self.clusters:
             if any(table in involved_tables for table in cluster):
-                continue
+                self.relevant_clusters.append(cluster)
             for table_name in cluster:
                 self.remove_table_from_join(table_name)
-                updated_where_clause = self.predicates_without_table_dfs(self.node.whereClause, table_name)
+                updated_where_clause = self.predicates_without_table_dfs(
+                    pglast.node.Node(self.node).whereClause, table_name)
                 self.node.whereClause = updated_where_clause
 
     def remove_table_from_join(self, table_name: str):
@@ -105,6 +116,7 @@ class Phase1:
         class RemoveTableVisitor(Visitor):
             def __init__(self, table_name):
                 self.table_name = table_name
+
             def visit_JoinExpr(self, _, node):
                 if isinstance(node.larg, pglast.ast.RangeVar):
                     rangeVar = node.larg
@@ -116,17 +128,18 @@ class Phase1:
                     table_name = rangeVar.alias.aliasname if rangeVar.alias else rangeVar.relname
                     if table_name == self.table_name:
                         return node.larg
+
             def visit_RangeSubselect(self, _, node):
                 return pglast.visitors.Skip()
             # do not consider sublink yet
+
             def visit_SubLink(self, _, node):
                 return pglast.visitors.Skip()
         remove_table_vistor = RemoveTableVisitor(table_name)
         remove_table_vistor(self.node)
-    
-    def predicates_without_table_dfs(self, node: pglast.ast.Node, table_name: str):
+
+    def predicates_without_table_dfs(self, node: pglast.node.Node, table_name: str):
         """return a modified version of node that eliminates all predicates involving table_name"""
-        node = pglast.node.Node(node)
         if node is Missing:
             return None
         if isinstance(node, pglast.node.Scalar):
@@ -135,10 +148,109 @@ class Phase1:
             involved_tables = find_involved_tables(node.ast_node)
             return None if table_name in involved_tables else node.ast_node
         # node is BoolExpr
-        args = [self.predicates_without_table_dfs(arg.ast_node, table_name) for arg in node.args]
+        args = [self.predicates_without_table_dfs(
+            arg, table_name) for arg in node.args]
         args = [arg for arg in args if arg is not None]
         return ast_BoolExpr(node.boolop.value, args)
-    
+
+    def zoom_in_if_center_one_only(self):
+        """if all side tables are irrelevant and have been removed and there is only one center table,
+           then we zoom in to the center table
+           returns true if this happens
+           assume center_tables and relevant_clusters have been calculated
+        """
+        if len(self.center_tables) != 1 or len(self.relevant_clusters) > 0:
+            return False
+        center_table = self.center_tables[0]
+        assert(len(self.top_level.target_columns) == 1)
+        target_column = list(self.top_level.target_columns.values())[0]
+        # replace each columnRef in the selected field with actual content in inner table
+        # if the columnRef to be replaced is in agg function and the replacement contains another aggregate function, we can't proceed
+        select_column_node = deepcopy(target_column.val)
+        select_column_node, inner_has_aggregate, outer_has_aagregate = self.interpret_column_in_inner_scope(
+            select_column_node, self.context.columns[center_table])
+        if inner_has_aggregate and outer_has_aagregate:
+            return False
+        # construct new branch's select
+        new_branch = deepcopy(self.context.table_node[center_table])
+        if outer_has_aagregate and new_branch.distinctClause is not None:
+            self.make_aggregate_distinct(select_column_node)
+            new_branch.distinctClause = None
+        new_branch.targetList = [pglast.ast.ResTarget(
+            name=target_column.name, val=select_column_node)]
+        # construct new branch's group by
+        group_clause = []
+        if new_branch.groupClause is not None:
+            group_clause.extend(new_branch.groupClause)
+        if len(self.top_level.group_columns) > 0:
+            for column in self.top_level.group_columns:
+                group_column_node, _, _ = self.interpret_column_in_inner_scope(
+                    deepcopy(column.val), self.context.columns[center_table])
+                group_clause.append(group_column_node)
+        # deduplicate group by columns
+        seen = set()
+        new_group_column_nodes = []
+        for group_column_node in group_clause:
+            text_form = RawStream()(group_column_node)
+            if text_form not in seen:
+                seen.add(text_form)
+                new_group_column_nodes.append(group_column_node)
+        if len(new_group_column_nodes) > 0:
+            new_branch.groupClause = new_group_column_nodes
+        self.node = new_branch
+        return True
+
+    @staticmethod
+    def interpret_column_in_inner_scope(ast_node: pglast.ast.Node, columns: Dict[str, Column]):
+        class IsAggregateVisitor(Visitor):
+            def __init__(self):
+                self.is_aggregate = False
+
+            def visit_FuncCall(self, _, node):
+                if node.funcname[0].val in AGGREGATE_NAMES:
+                    self.is_aggregate = True
+
+            def visit_SubLink(self, _, node):
+                return pglast.visitors.Skip()
+
+        class InterpretVisitor(Visitor):
+            def __init__(self, columns: Dict[str, Column]):
+                self.inner_has_aggregate = False
+                self.columns = columns
+
+            def visit_ColumnRef(self, _, node):
+                assert(len(node.fields) == 2)
+                column_name = node.fields[1].val
+                replacement = self.columns[column_name].val
+                is_aggregate_visitor = IsAggregateVisitor()
+                is_aggregate_visitor(replacement)
+                self.inner_has_aggregate = self.inner_has_aggregate or is_aggregate_visitor.is_aggregate
+                return replacement
+            # do not go into sublink
+
+            def visit_SubLink(self, _, node):
+                return pglast.visitors.Skip()
+        # dummy node needed to be able to replace itself entirely
+        dummy_node = pglast.ast.ResTarget(val=ast_node)
+        interpret_visitor = InterpretVisitor(columns)
+        interpret_visitor(dummy_node)
+        is_aggregate_visitor = IsAggregateVisitor()
+        is_aggregate_visitor(dummy_node)
+        return dummy_node.val, interpret_visitor.inner_has_aggregate, is_aggregate_visitor.is_aggregate
+
+    @staticmethod
+    def make_aggregate_distinct(ast_node: pglast.ast.Node):
+        class AggregateDistinctVisitor(Visitor):
+            def visit_FuncCall(self, _, node):
+                if node.funcname[0].val in AGGREGATE_NAMES:
+                    node.agg_distinct = True
+
+            def visit_SubLink(self, _, node):
+                return pglast.visitors.Skip()
+        aggregate_distinct_visitor = AggregateDistinctVisitor()
+        aggregate_distinct_visitor(ast_node)
+    # def check_isolated(self):
+
     def check_idempotent(self):
         """check if the hole is idempotent, i.e. return same thing regardless of whether there is only one
            or more than one rows with same value in the fields it involves
@@ -154,38 +266,42 @@ class Phase1:
             if all(table not in involved_tables for table in cluster):
                 irrelevant_cluster += 1
         return irrelevant_cluster == 0
-        
 
-if __name__ == "__main__":      
+
+if __name__ == "__main__":
     schema_file = "phase1schema.json"
     # sql = """WITH cte AS (SELECT 1 as cst1, a.a1 as a1 FROM a) SELECT (SELECT 3 FROM d) k2, a2.a + 1 k2 FROM c c2 CROSS JOIN (SELECT * FROM a) as a2 WHERE EXISTS (SELECT 3 FROM d)"""
-    sql = """SELECT
-        COUNT(DISTINCT A.id, B.id) ab
-    FROM I
-        LEFT JOIN A
-        ON I.x1 < A.a1
-        INNER JOIN (
-        B
-        LEFT JOIN C
-        ON I.x2 < C.c1
-        CROSS JOIN E)
-        ON B.b1 > A.a2
-        LEFT JOIN D
-        ON D.d1 = C.c2
-        WHERE B.b1 >= A.a2 AND (A.a1 < A.a1 OR I.x2 < C.c1) OR NOT(D.d1 = C.c2 AND 1 AND B.id < 1 AND E.id = D.id)
-    GROUP BY I.x"""
+    # sql = """SELECT
+    #     COUNT(DISTINCT A.id, B.id) ab
+    # FROM I
+    #     LEFT JOIN A
+    #     ON I.x1 < A.a1
+    #     INNER JOIN (
+    #     B
+    #     LEFT JOIN C
+    #     ON I.x2 < C.c1
+    #     CROSS JOIN E)
+    #     ON B.b1 > A.a2
+    #     LEFT JOIN D
+    #     ON D.d1 = C.c2
+    #     WHERE B.b1 >= A.a2 AND (A.a1 < A.a1 OR I.x2 < C.c1) OR NOT(D.d1 = C.c2 AND 1 AND B.id < 1 AND E.id = D.id)
+    # GROUP BY I.x"""
+    sql = """SELECT COUNT(aa.a1) c1 FROM (SELECT a.a1 FROM a GROUP BY a.a1) aa CROSS JOIN b GROUP BY aa.a1"""
 
     root = pglast.node.Node(parse_sql(sql))
     node = root[0].stmt
 
     full_analyzer = FullAnalyzer(sql, schema_file)
     context = full_analyzer()
-
+    # node = context.table_node[TOP]
+    # print(RawStream()(node))
     phase1 = Phase1(node.ast_node, context)
-    phase1.find_center_columns()
+    phase1.find_center_tables()
     phase1.find_clusters()
-    print(phase1.center_columns, phase1.clusters)
-    print("before", RawStream()(phase1.node))
+    print(phase1.center_tables, phase1.clusters)
+    print("before:", RawStream()(phase1.node))
     phase1.remove_irrelevant_clusters()
-    print("after", RawStream()(phase1.node))
-    print(phase1.check_idempotent())
+    print("after remove:", RawStream()(phase1.node))
+    zoom = phase1.zoom_in_if_center_one_only()
+    if zoom:
+        print("after zoom:", RawStream()(phase1.node))

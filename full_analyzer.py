@@ -5,11 +5,9 @@ import pglast
 from pglast import parser, parse_sql, Missing
 from pglast.visitors import Visitor
 import json
-from common import Column, FullContext
+from common import Column, Counter, FullContext, TOP, AGGREGATE_NAMES, add_ast_node_to_select
 from top_level_analyzer import TopLevelAnalyzer
 
-TOP = "%top%"
-AGGREGATE_NAMES = ["count", "sum", "min", "max", "avg"]
 
 # Assumptions
 # REMEDIABLE: Sublink yet to be supported
@@ -41,8 +39,8 @@ class FullAnalyzer:
         self.fill_columns_raw()
         self.fill_columns_dfs(TOP)
         self.find_center_columns()
-        self.find_holes()
-        return FullContext(self.top_level_tables_inside, self.columns, self.unique_column_tuples)
+        table_ast_node = {table: node.ast_node for table, node in self.table_node.items()}
+        return FullContext(table_ast_node, self.top_level_tables_inside, self.columns, self.unique_column_tuples)
 
     def find_hierarchy(self):
         """fill in top_level_tables_inside and table_node"""
@@ -200,16 +198,22 @@ class FullAnalyzer:
         """qualify columns with the inner tables they come from, i.e. c -> t.c"""
         # column name from inner table -> ColumnRef with fields (inner table, column)
         qualified_columnRef = {}
+        repeated_names = set()
         for top_level_table in top_level_tables:
             for column in self.columns[top_level_table]:
+                if column in qualified_columnRef:
+                    repeated_names.add(column)
                 qualified_columnRef[column] = Column.create(top_level_table, column).val
                 
         class QualifyVisitor(Visitor):
-            def __init__(self, qualified_columnRef):
+            def __init__(self, qualified_columnRef, repeated_names):
                 self.qualified_columnRef = qualified_columnRef
+                self.repeated_names = repeated_names
             def visit_ColumnRef(self, ancestor, node):
                 if len(node.fields) == 1 and node.fields[0].val in self.qualified_columnRef:
                     column = node.fields[0].val
+                    if column in self.repeated_names:
+                        raise Exception(f"Column reference {column} is ambiguous without specifying table")
                     return self.qualified_columnRef[column]
                 return None
             def visit_RangeSubselect(self, _, node):
@@ -217,12 +221,14 @@ class FullAnalyzer:
             # do not consider sublink yet
             def visit_SubLink(self, _, node):
                 return pglast.visitors.Skip() 
-        qualify_visitor = QualifyVisitor(qualified_columnRef)
+        qualify_visitor = QualifyVisitor(qualified_columnRef, repeated_names)
         qualify_visitor(node.ast_node)
         
 
     def fill_unique_column_tuples(self, table_name):
-        """helper function of fill_columns_dfs, fill unique_column_tuples for this table"""
+        """helper function of fill_columns_dfs, fill unique_column_tuples for this table
+           add columns to select if this is necessary for creating unique keys
+        """
         node = self.table_node[table_name]
         self.unique_column_tuples[table_name] = []
         # find all columns that are directly from a children table
@@ -232,41 +238,7 @@ class FullAnalyzer:
                 inner_columns[column_obj.exact_inner] = column_name
         # fill in unique_column_tuples
         if node.groupClause is not Missing:
-            cartesian_components = []
-            top_level_analyzer = TopLevelAnalyzer(node.ast_node)
-            top_level_analyzer.set_target_columns(self.columns[table_name])
-            group_columns = top_level_analyzer.find_group_columns()
-            tuple_exact_inners = []
-            for group_column in group_columns:
-                # an inner column
-                if isinstance(group_column.exact_inner, Tuple):
-                    tuple_exact_inners.append(group_column.exact_inner)
-                # not an inner column, but is a select column
-                if isinstance(group_column.exact_inner, str):
-                    cartesian_components.append([[group_column.exact_inner]])
-                # neither an inner column nor a select column
-                elif group_column.exact_inner is None:
-                    cartesian_components.append([])
-            # for exact group-by columns belonging to the same child table, try to eliminate some with unique info
-            # i.e. find all child unique tuples for each child table that is a subset of the group-by columns
-            tuple_exact_inners.sort(key = lambda table_column: table_column[0])
-            by_table = itertools.groupby(tuple_exact_inners, lambda table_column: table_column[0])
-            by_table = {table: [table_column[1] for table_column in table_columns] for table, table_columns in by_table}
-            for table in by_table:
-                cartesian_component = []
-                group_columns = by_table[table]
-                for unique_tuple in self.unique_column_tuples[table]:
-                    if all(column in group_columns for column in unique_tuple) and \
-                        all((table, column) in inner_columns for column in unique_tuple):
-                        # convert it back to columns present in select clause and add to result
-                        cartesian_component.append([inner_columns[(table, column)] for column in unique_tuple])
-                # can't simplify, try default
-                if len(cartesian_component) == 0:
-                    if all((table, column) in inner_columns for column in group_columns):
-                        cartesian_component.append([inner_columns[(table, column)] for column in group_columns])
-                cartesian_components.append(cartesian_component)
-            product = itertools.product(*cartesian_components)
-            self.unique_column_tuples[table_name] = [list(itertools.chain.from_iterable(cols)) for cols in product]
+            self.unique_column_tuples[table_name] = self.find_group_by_unique_tuples(node, inner_columns)
         elif node.distinctClause is not Missing:
             self.unique_column_tuples[table_name] = [list(self.columns[table_name])]
         elif node.op.value == pglast.enums.parsenodes.SetOperation.SETOP_UNION:
@@ -284,6 +256,60 @@ class FullAnalyzer:
                 if all(column in inner_columns for column in candidate_tuple):
                     candidate_tuple = [inner_columns[column] for column in candidate_tuple]
                     self.unique_column_tuples[table_name].append(candidate_tuple)
+    
+    def find_group_by_unique_tuples(self, node: pglast.node.Node, inner_columns: Dict[Tuple[str, str], str]):
+        cartesian_components = []
+        top_level_analyzer = TopLevelAnalyzer(node.ast_node)
+        top_level_analyzer.find_target_columns()
+        group_columns = top_level_analyzer.find_group_columns()
+        tuple_exact_inners = []
+        counter = Counter()
+        for group_column in group_columns:
+            # an inner column
+            if isinstance(group_column.exact_inner, Tuple):
+                tuple_exact_inners.append(group_column.exact_inner)
+            # not an inner column, but is a select column
+            if isinstance(group_column.exact_inner, str):
+                cartesian_components.append([[group_column.exact_inner]])
+            # neither an inner column nor a select column, then make it a select column
+            elif group_column.exact_inner is None:
+                column_name = "groupby_column_" + str(counter.count())
+                add_ast_node_to_select(node.ast_node, group_column.val, column_name)
+                cartesian_components.append([[column_name]])
+        # for exact group-by columns belonging to the same child table, try to eliminate some with unique info
+        # i.e. find all child unique tuples for each child table that is a subset of the group-by columns
+        tuple_exact_inners.sort(key = lambda table_column: table_column[0])
+        by_table = itertools.groupby(tuple_exact_inners, lambda table_column: table_column[0])
+        by_table = {table: [column for _, column in table_columns] for table, table_columns in by_table}
+        for table in by_table:
+            cartesian_component = []
+            group_columns_about_this_child = by_table[table]
+            subsets = [group_columns_about_this_child]
+            for unique_tuple in self.unique_column_tuples[table]:
+                if all(column in group_columns_about_this_child for column in unique_tuple):
+                    subsets.append(unique_tuple)
+            # has proper subset, don't need the full one
+            if len(subsets) > 1:
+                subsets.pop(0)
+            for subset in subsets:
+                if all((table, column) in inner_columns for column in subset):
+                    cartesian_component.append([inner_columns[(table, column)] for column in subset])
+            # no viable subsets, choose the first one and add necessary columns to select
+            if len(cartesian_component) == 0:
+                subset = subsets[0]
+                outer_column_names = []
+                for column in subset:
+                    if (table, column) in inner_columns:
+                        outer_column_names.append(inner_columns[(table, column)])
+                    else:
+                        column_name = "groupby_column_" + str(counter.count())
+                        add_ast_node_to_select(node.ast_node, Column.create(table, column).val, column_name)
+                        outer_column_names.append(column_name)
+                cartesian_component.append(outer_column_names)
+            cartesian_components.append(cartesian_component)
+        product = itertools.product(*cartesian_components)
+        return [list(itertools.chain.from_iterable(cols)) for cols in product]
+    
     
     @staticmethod                
     def cartesian_of_child_unique_tuples(top_level_tables: list, columns: Dict[str, Column], unique_column_tuples: Dict[str, list]):
@@ -346,38 +372,15 @@ class FullAnalyzer:
         for inner_column in columns_to_explore:
             result.extend(self.trace_column_to_raw_dfs(inner_column))
         return result
-        
-    def find_holes(self):
-        """Find all holes"""
-        top = self.table_node[TOP]
-        # assume top-level select statement does not have set operation
-        if top.op.value != pglast.enums.parsenodes.SetOperation.SETOP_NONE:
-            raise Exception("Run this algorithm on each top-level set (e.g. component of UNION)!")
-        class HoleVisitor(Visitor):
-            def __init__(self):
-                self.holes = []
-            def visit_FuncCall(self, _, node):
-                if node.funcname[0].val in AGGREGATE_NAMES:
-                    self.holes.append(node)
-            def visit_WithClause(self, _, node):
-                return pglast.visitors.Skip()
-            def visit_SelectStmt(self, _, node):
-                return pglast.visitors.Skip()
-            # do not consider SubLink yet
-            def visit_SubLink(self, _, node):
-                return pglast.visitors.Skip()    
-        visitor = HoleVisitor()
-        visitor(top.ast_node)
-        self.holes = visitor.holes
             
 
 if __name__ == "__main__":           
     schema_file = "testschema.json"
     # sql = """WITH cte AS (SELECT 1 as cst1, a.a1 as a1 FROM a) SELECT (SELECT 3 FROM d) k2, a2.a + 1 k2 FROM c c2 CROSS JOIN (SELECT * FROM a) as a2 WHERE EXISTS (SELECT 3 FROM d)"""
-    sql = "SELECT a1, COUNT(a.a2) col FROM a CROSS JOIN b GROUP BY COUNT(a.a2)"
+    sql = "SELECT a1 col FROM a CROSS JOIN b GROUP BY ABS(b.b1), a.id, a.a1"
     analyzer = FullAnalyzer(sql, schema_file)
     analyzer()
     from pglast.stream import RawStream
-    # print(RawStream()(analyzer.table_node[TOP]))
     print(analyzer.columns)
     print(analyzer.unique_column_tuples)
+    print(RawStream()(analyzer.table_node[TOP]))

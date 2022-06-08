@@ -1,10 +1,10 @@
-from copy import deepcopy
 import pglast
 from pglast import parse_sql
 from pglast.visitors import Visitor
 from typing import Dict, Tuple
 from pglast.enums.nodes import JoinType
-from common import Column, check_null_sensitive_dfs, find_involved_tables, decompose_predicate, reversed_graph
+from prometheus_client import Counter
+from common import Column, check_null_sensitive_dfs, find_involved_tables, decompose_predicate, reversed_graph, AGGREGATE_NAMES, Counter
 
 
 # Assumptions
@@ -168,9 +168,6 @@ class TopLevelAnalyzer:
         for table in edges_reversed:
             if safety[table] and table not in visited:
                 populate_safety_dfs(table)
-            
-        
-        
 
     @staticmethod
     def construct_null_edges_from_join_dfs(node: pglast.ast.Node, edges: Dict[str, list]):
@@ -211,13 +208,39 @@ class TopLevelAnalyzer:
             for table in involved_tables:
                 safety[table] = True
         return safety
-                    
+    
+    def find_holes(self):
+        """Find all holes"""
+        # assume top-level select statement does not have set operation
+        if self.node.op.value != pglast.enums.parsenodes.SetOperation.SETOP_NONE:
+            raise Exception("Can only find holes for select statements without top-level set operation")
+        class HoleVisitor(Visitor):
+            def __init__(self):
+                self.counter = Counter(-1)
+                self.holes = []
+            def visit_FuncCall(self, _, node):
+                if node.funcname[0].val in AGGREGATE_NAMES:
+                    self.holes.append(node)
+                # record this is the nth hole
+                node.location = self.counter.count()
+            def visit_WithClause(self, _, node):
+                return pglast.visitors.Skip()
+            def visit_RangeSubselect(self, _, node):
+                return pglast.visitors.Skip()
+            # do not consider SubLink yet
+            def visit_SubLink(self, _, node):
+                return pglast.visitors.Skip()    
+        hole_visitor = HoleVisitor()
+        hole_visitor(self.node)
+        return hole_visitor.holes
+        
     
 if __name__ == "__main__":           
     schema_file = "phase1schema.json"
     # sql = """SELECT a.a1 a1, a.a1 + b.b1 AS sum FROM (a cross join b) left join (SELECT c.c1 FROM c WHERE c.c1 = sum) c0 on abs(sum + c0.c1) where sum < 10 AND (sum < 9 OR sum < 8) AND sum + c0.c1 = 1"""
     sql = """SELECT
-        COUNT(DISTINCT A.id, B.id) ab
+        COUNT(DISTINCT A.id, B.id) ab,
+        MAX(D.d1) cd
     FROM I
         LEFT JOIN A
         ON I.x1 < A.a1
@@ -238,6 +261,7 @@ if __name__ == "__main__":
     analyzer()
     analyzer.replace_column_alias_usage()
     edges, safety = analyzer.find_null_graph_and_safety()
-    print(edges, safety)
+    holes = analyzer.find_holes()
+    print(analyzer.node.targetList[1].val.location)
 
         

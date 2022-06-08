@@ -5,6 +5,9 @@ from pglast import Missing
 from typing import Dict, Set, List
 from pglast.stream import RawStream
 
+TOP = "%top%"
+AGGREGATE_NAMES = ["count", "sum", "min", "max", "avg"]
+
 class Column:
     """
     Attributes:
@@ -35,7 +38,7 @@ class Column:
     
     @classmethod
     def from_ast_node(cls, ast_node: pglast.ast.Node, name: str):
-        """Takes in a ResTarget"""
+        """Takes in a ast node"""
         self = cls()
         self.name = name
         self.val = ast_node
@@ -87,14 +90,15 @@ class Column:
         return result
     
 class FullContext:
-    def __init__(self, top_level_tables_inside, columns, unique_column_tuples):
+    def __init__(self, table_node, top_level_tables_inside, columns, unique_column_tuples):
+        self.table_node: Dict[str, pglast.ast.Node] = table_node
         self.top_level_tables_inside: Dict[str, list] = top_level_tables_inside
         self.columns: Dict[str, Dict[str, Column]] = columns
         self.unique_column_tuples: Dict[str, list] = unique_column_tuples
         
 class Counter:
-    def __init__(self):
-        self.counter = 0
+    def __init__(self, initial: int = 0):
+        self.counter = initial
 
     def count(self):
         self.counter += 1
@@ -116,6 +120,7 @@ def find_depending_columns(ast_node: pglast.ast.Node):
 def find_involved_tables(ast_node: pglast.ast.Node) -> set:
     depending_columns = find_depending_columns(ast_node)
     return set(table_column[0] for table_column in depending_columns)
+    
         
 def connected_component_dfs(vertex, edges: Dict[str, list], visited: Set, component: list):
     visited.add(vertex)
@@ -160,6 +165,13 @@ def strongly_connected_components(edges):
             collect_component_dfs(vertex, component)
             components.append(component)
     return components
+
+def add_ast_node_to_select(root: pglast.ast.SelectStmt, ast_node: pglast.ast.Node, name: str):
+    resTarget = pglast.ast.ResTarget(name=name, val=ast_node)
+    targetList = list(root.targetList)
+    targetList.append(resTarget)
+    root.targetList = targetList
+    
 
 def ast_BoolExpr(boolop: BoolExprType, predicates: List):
     if len(predicates) == 0:

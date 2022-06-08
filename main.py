@@ -1,5 +1,6 @@
 import pglast
 from pglast.enums.parsenodes import SetOperation
+from pglast.stream import RawStream
 from copy import deepcopy
 from enum import Enum
 from typing import Dict, Set, Tuple, List
@@ -7,6 +8,7 @@ from common import Counter, FullContext
 from full_analyzer import FullAnalyzer
 from phase1 import Phase1
 from phase2 import Phase2
+from top_level_analyzer import TopLevelAnalyzer
 
 
 class Penalty(Enum):
@@ -19,40 +21,38 @@ class Branch:
     def __init__(
         self,
         root: pglast.ast.Node,
-        depth: int,
+        join_level: int,
         parent: int,
         penalty: list = [],
-        eqPool: List[pglast.ast.Node] = [],
-        oblList: list = [],
-        agg: str = None,
-        key: list = None,
+        eq_pool: List[pglast.ast.Node] = [],
+        obl_list: list = [],
         ) -> int:
-        """return id"""
         assert(isinstance(root, pglast.ast.Node))
         assert(len(root.targetList) == 1)
         self.ast_node: pglast.ast.Node = root
-        self.depth: int = depth
+        self.join_level: int = join_level
         self.parent: int = parent
         self.penalty: list = penalty
-        self.eqPool: list[pglast.ast.Node] = eqPool
-        self.oblList: list = oblList
-        self.agg: str = agg
-        self.key: list = key
+        self.eq_pool: list[pglast.ast.Node] = eq_pool
+        self.obl_list: list = obl_list
         self.children: Dict[int, List[int]] = []
-        # Set operation type
-        self.children_type: Dict[int, SetOperation] = {}
+        # SetOperation:
+        # None means no children
+        # SETOP_UNION, SETOP_INTERSECT, SETOP_EXCEPT have literal meaning
+        # SETOP_NONE means combining through holes
+        self.children_type: SetOperation = None
         self.leaf = False
         self.free = False
         # starts with 1
         self.id = self.counter.count()
 
 
-class HoleBuilder:
+class BranchBuilder:
     def __init__(self, initial_root: pglast.ast.SelectStmt, context: FullContext):
         self.id_to_branch: Dict[int, List[Branch]] = {}
         initial_branch = Branch(initial_root, 1, 0)
+        self.id_to_branch[initial_branch.id] = [initial_branch]
         self.new_branches = [initial_branch.id]
-        self.next_branches = []
 
     def build(self):
         while len(self.new_branches) > 0:
@@ -61,6 +61,7 @@ class HoleBuilder:
                 self.execute_one_round(branch)
 
     def execute_one_round(self, branch: Branch):
+        # Phase 0
         # split branch if there's top level set operation
         if self.split_set_operation(branch):
             return
@@ -69,28 +70,60 @@ class HoleBuilder:
         phase1.find_center_columns()
         phase1.find_clusters()
         phase1.remove_irrelevant_clusters()
-        idempotentphase1.check_idempotent())
+        idempotent_penalty = phase1.check_idempotent()
+        # Phase 2
+        phase2 = Phase2(phase1.node, self.context, phase1.center_columns)
+        phase2.find_outer_table()
+        phase2.replace_between_and()
+        case_branches = phase2.expand_crossing_case_when()
+        print("Case branches")
+        subbranches = []
+        for index, case_branch in enumerate(case_branches):
+            print(index, RawStream()(case_branch),"\n")
+            conjunct_branches, penalty = phase2.expand_crossing_conjuncts(case_branch)
+            for conjunct_branch in conjunct_branches:
+                print(RawStream()(conjunct_branch),"\n")
+                subbranches.append(conjunct_branch)
+        # Phase 3
 
     def split_set_operation(self, branch: Branch):
         """if there is set operations like UNION/INTERSECTION/EXCEPT in top level,
            split them into different branches
         """
-        root=branch.ast_node
-        if branch.ast_node.op.value == SetOperation.SETOP_NONE:
+        root = branch.ast_node
+        child_roots = []
+        if branch.ast_node.op.value != SetOperation.SETOP_NONE:
+            # check union/intersection/except
+            branch.children_type = branch.ast_node.op.value
+            child_roots.extend([root.larg, root.rarg])
+        else:
+            top_level_analyzer = TopLevelAnalyzer(root)
+            holes = top_level_analyzer.find_holes()
+            # split only if we have at least 2 holes
+            if len(holes) > 1:
+                # means children_type is "holes"
+                branch.children_type = SetOperation.SETOP_NONE
+            for hole in holes:
+                child_root = deepcopy(root)
+                child_root.targetList = [pglast.ast.ResTarget(name="agg", val=hole)]
+                child_roots.append(child_root)
+        if branch.children_type is None:
             return False
-        # create children and add to next_branches
-        for ast_node in (root.larg, root.rarg):
-            child=Branch(ast_node, branch.depth + 1, branch.id)
-            child.penalty=branch.penalty
-            child.eqPool=branch.eqPool
-            child.oblList=branch.oblList
-            child.agg=branch.agg
-            child.key=branch.key
-            self.id_to_branch[child.id]=[child]
+        for child_root in child_roots:
+            child = Branch(
+                child_root, 
+                branch.join_level,
+                branch.id, 
+                branch.penalty, 
+                branch.eq_pool,
+                branch.obl_list,
+            )
+            self.id_to_branch[child.id] = [child]
             branch.children[branch.id].append(child.id)
-            self.next_branches.append(child)
-        branch.children_type=branch.ast_node.op.value
+            self.next_branches.append(child)        
         return True
+            
+            
 
 
 
@@ -118,5 +151,5 @@ def main(sql, schema_file):
         root=deepcopy(full_analyzer.root.ast_node)
         hole_name=f"HOLE_{index}"
         root.targetList=[pglast.ast.ResTarget(name = hole_name, val = hole)]
-        hole_builder=HoleBuilder(root, context)
+        hole_builder=BranchBuilder(root, context)
         hole_builder.build()
