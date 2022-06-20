@@ -1,3 +1,4 @@
+import json
 import pglast
 from pglast import parser, parse_sql, Missing
 from pglast.visitors import Visitor
@@ -8,19 +9,19 @@ from full_analyzer import FullAnalyzer, FullContext
 from typing import Dict, Set, Tuple, List
 from pglast.stream import RawStream
 from copy import deepcopy
-from common import find_involved_tables, add_predicates_to_where, ast_BoolExpr
+from common import TOP, find_involved_tables, add_predicates_to_where, ast_BoolExpr
 from pglast_z3 import construct_formula_from_ast_node, construct_ast_node_from_formula_dfs, convert_formula_to_cnf, simplify_formula
 import z3
 
 
 class Phase2:
-    def __init__(self, node: pglast.ast.Node, context: FullContext, center_columns: list):
+    def __init__(self, node: pglast.ast.Node, context: FullContext, center_tables: list):
         if not isinstance(node, pglast.ast.Node):
             raise Exception("ToplevelAnalyzer accepts ast.Node, not node.Node")
         self.node: pglast.ast.Node = node
         self.context: FullContext = context
         self.top_level: TopLevelAnalyzer = TopLevelAnalyzer(node)
-        self.center_columns: list[tuple(str, str)] = center_columns
+        self.center_tables: list[str] = center_tables
         self.outer_tables: list[str] = None
         # init
         self.top_level()
@@ -28,18 +29,18 @@ class Phase2:
     def find_outer_table(self):
         """find outer tables, which will be used to determine whether a predicate "crosses"
         """
-        center_tables = [table_column[0] for table_column in self.center_columns]
-        if len(center_tables) == 0 or len(center_tables) == len(self.top_level.tables):
+        if len(self.center_tables) == 0 or len(self.center_tables) == len(self.top_level.tables):
             # no center table or everything is center table
-            tables_in_hole = find_involved_tables(self.targetList[0])
-            if len(tables_in_hole) == 0:
-                # hole only involves a single table, so skip Phase 2
+            tables_in_hole = find_involved_tables(self.node.targetList[0], self.context.sublink_exterior_columns)
+            tables_not_in_hole = set(self.top_level.tables) - set(tables_in_hole)
+            if len(tables_not_in_hole) == 0:
+                # hole involves every table , so skip Phase 2
                 self.outer_tables = []
-            else:
-                # randomly choose one table involved in hole to be outer table
-                self.outer_tables = [tables_in_hole[0]]
+                return
+            # randomly choose one table involved in hole to be outer table
+            self.outer_tables = next(iter(tables_not_in_hole))
         else:
-            self.outer_tables = center_tables
+            self.outer_tables = self.center_tables
     
     def check_crosses(self, tables: List[str]):
         """check whether a list of tables contain both an outer table and an inner table
@@ -89,11 +90,12 @@ class Phase2:
            return a list of nodes
         """
         class ExpandCaseWhenVisitor(Visitor):
-            def __init__(self, root: pglast.ast.Node, check_crosses):
+            def __init__(self, root: pglast.ast.Node, check_crosses, sublink_exterior_columns):
                 self.branches = [(root, [])]
                 self.check_crosses = check_crosses
+                self.sublink_exterior_columns = sublink_exterior_columns
             def visit_CaseExpr(self, ancestors, node):
-                involved_tables = find_involved_tables(pglast.node.Node(node))
+                involved_tables = find_involved_tables(node, self.sublink_exterior_columns)
                 if not self.check_crosses(involved_tables):
                     return None
                 # this case expression "crosses"
@@ -136,7 +138,7 @@ class Phase2:
                     updated_list[last_step] = replacement
                     setattr(node, second_last_step, updated_list)
             
-        visitor = ExpandCaseWhenVisitor(self.node, self.check_crosses)
+        visitor = ExpandCaseWhenVisitor(self.node, self.check_crosses, self.context.sublink_exterior_columns)
         visitor(self.node)
         branches = []
         for root, branch_conditions in visitor.branches:
@@ -151,7 +153,7 @@ class Phase2:
            will be expanded into two branches, one with WHERE a.a1 = o.o1, another with WHERE a.a1 < 1
            assume outer_tables has been computed
         """
-        penalty = Phase2.add_on_predicates_to_where(root)
+        penalty = self.add_on_predicates_to_where(root)
         # convert WHERE clause to CNF form
         if not isinstance(root.whereClause, pglast.ast.BoolExpr):
             return [root], penalty
@@ -173,7 +175,7 @@ class Phase2:
             replacement_predicates = []
             non_crossing_predicates = []
             for predicate in conjunct.args:
-                involved_tables = find_involved_tables(pglast.node.Node(predicate))
+                involved_tables = find_involved_tables(predicate, self.context.sublink_exterior_columns)
                 if self.check_crosses(involved_tables):
                     replacement_predicates.append(predicate)
                 else:
@@ -203,22 +205,21 @@ class Phase2:
             branches.append(new_root)
         return branches, penalty
     
-    @staticmethod
-    def add_on_predicates_to_where(root: pglast.ast.SelectStmt):
+    def add_on_predicates_to_where(self, root: pglast.ast.SelectStmt):
         """Add all predicates appearing in ON clause to WHERE clause
            Incur penalty when doing so is not safe
         """
         top_level = TopLevelAnalyzer(root)
         top_level()
         top_level.replace_column_alias_usage()
-        _, safety = top_level.find_null_graph_and_safety()
+        _, safety = top_level.find_null_graph_and_safety(self.context.sublink_exterior_columns)
         # fetch all predicates in "ON" clause
         class OnPredicateFetcher(Visitor):
             def __init__(self):
                 self.predicates = []
             def visit_JoinExpr(self, _, node):
                 if node.quals is not None:
-                    self.predicates.append(node.quals)
+                    self.predicates.append(deepcopy(node.quals))
             def visit_RangeSubselect(self, _, node):
                 return pglast.visitors.Skip()
             # do not consider sublink yet
@@ -231,22 +232,19 @@ class Phase2:
         # if not all tables involved in an on-predicate are safe, impose penalty
         penalty = 0
         for predicate in on_predicates:
-            involved_tables = set(find_involved_tables(predicate))
+            involved_tables = set(find_involved_tables(predicate, self.context.sublink_exterior_columns))
             if any(safety[table] == False for table in involved_tables):
                 penalty += 1
         add_predicates_to_where(root, on_predicates)
         return penalty
+
             
 
 if __name__ == "__main__":
     schema_file = "1212schema.json"
-    sql1 = """SELECT sum(a.a2 + b.b1) col FROM a LEFT JOIN b ON (a.a1 < 1 AND a.a1 <= b.b1) INNER JOIN c ON a.a1 = c.c1  WHERE (a.a1 <= a.a2) GROUP BY a.a1"""
-
-    root = pglast.node.Node(parse_sql(sql1))
-    node = root[0].stmt
-    penalty = Phase2.add_on_predicates_to_where(node.ast_node)
-    print("penalty:", penalty, RawStream()(node))
-
+    with open(schema_file) as file:
+        schema = json.load(file)
+    # sql1 = """SELECT sum(a.a2 + b.b1) col FROM a LEFT JOIN b ON (a.a1 < 1 AND a.a1 <= b.b1) INNER JOIN c ON a.a1 = c.c1  WHERE (a.a1 <= a.a2) GROUP BY a.a1"""
     sql2 = """
     SELECT  t.team_id
        ,t.team_name
@@ -257,11 +255,10 @@ GROUP BY  t.team_id
          ,t.team_name
 ORDER BY num_points DESC
          ,t.team_id ASC"""
-    
-    full_analyzer = FullAnalyzer(sql2, schema_file)
+    full_analyzer = FullAnalyzer(sql2, schema)
     context = full_analyzer()
-    full_analyzer()
-    phase2 = Phase2(node.ast_node, context, ['t'])
+    node = context.table_node[TOP]
+    phase2 = Phase2(node, context, ['t'])
     phase2.find_outer_table()
     case_branches = phase2.expand_crossing_case_when()
     print("Case branches")

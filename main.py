@@ -4,6 +4,8 @@ from pglast.stream import RawStream
 from copy import deepcopy
 from enum import Enum
 from typing import Dict, Set, Tuple, List
+
+from sqlalchemy import false
 from common import Counter, FullContext
 from full_analyzer import FullAnalyzer
 from phase1 import Phase1
@@ -41,8 +43,6 @@ class Branch:
         # SETOP_UNION, SETOP_INTERSECT, SETOP_EXCEPT have literal meaning
         # SETOP_NONE means combining through holes
         self.children_type: SetOperation = None
-        self.leaf = False
-        self.free = False
         # starts with 1
         self.id = self.counter.count()
 
@@ -70,9 +70,17 @@ class BranchBuilder:
         phase1.find_center_columns()
         phase1.find_clusters()
         phase1.remove_irrelevant_clusters()
+        if phase1.zoom_in_if_center_one_only():
+            branch.children_type = SetOperation.SETOP_UNION
+            self.fork_branch_and_add_to_next(branch, phase1.node, True)
+            return
+        if phase1.check_free_from_center():
+            branch.children_type = SetOperation.SETOP_UNION
+            self.free_branch_and_add_to_next(branch, phase1.node)
+            return
         idempotent_penalty = phase1.check_idempotent()
         # Phase 2
-        phase2 = Phase2(phase1.node, self.context, phase1.center_columns)
+        phase2 = Phase2(phase1.node, self.context, phase1.center_tables)
         phase2.find_outer_table()
         phase2.replace_between_and()
         case_branches = phase2.expand_crossing_case_when()
@@ -110,21 +118,32 @@ class BranchBuilder:
         if branch.children_type is None:
             return False
         for child_root in child_roots:
-            child = Branch(
-                child_root, 
-                branch.join_level,
-                branch.id, 
-                branch.penalty, 
-                branch.eq_pool,
-                branch.obl_list,
-            )
-            self.id_to_branch[child.id] = [child]
-            branch.children[branch.id].append(child.id)
-            self.next_branches.append(child)        
+            self.fork_branch_and_add_to_next(branch, child_root, False)  
         return True
             
-            
+    def fork_branch_and_add_to_next(self, parent: Branch, child_root: pglast.ast.SelectStmt, increment_join_level: bool):
+        child = Branch(
+            child_root, 
+            parent.join_level + (1 if increment_join_level else 0),
+            parent.id, 
+            parent.penalty, 
+            parent.eq_pool,
+            parent.obl_list,
+        )
+        self.id_to_branch[child.id] = [child]
+        parent.children[parent.id].append(child.id)
+        self.next_branches.append(child) 
 
+    def free_branch_and_add_to_next(self, parent: Branch, child_root: pglast.ast.SelectStmt):
+        child = Branch(
+            child_root, 
+            0,
+            parent.id, 
+            parent.penalty
+        )
+        self.id_to_branch[child.id] = [child]
+        parent.children[parent.id].append(child.id)
+        self.next_branches.append(child) 
 
 
 

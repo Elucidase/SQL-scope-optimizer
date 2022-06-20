@@ -2,10 +2,11 @@ import pglast
 from pglast.enums.primnodes import BoolExprType
 from pglast.visitors import Visitor
 from pglast import Missing
-from typing import Dict, Set, List
+from typing import Dict, Set, List, Tuple
 from pglast.stream import RawStream
 
 TOP = "%top%"
+SUBLINK = "%sublink%"
 AGGREGATE_NAMES = ["count", "sum", "min", "max", "avg"]
 
 class Column:
@@ -14,7 +15,7 @@ class Column:
         name: column name
         val: pglast.ast.Node expression for the column
         exact_inner: (table, name) if the column is exactly table.name where table is in a smaller scope; otherwise None
-        dependsOn: list of columns this column depends on
+        dependsOn: set of columns this column depends on
         text_form: plain text representation used to check if two columns are obviously equal
     """
     def __repr__(self):
@@ -32,7 +33,7 @@ class Column:
             [pglast.ast.String(table_name), pglast.ast.String(column)]
         )
         self.exact_inner = (table_name, column)
-        self.dependsOn = [self.exact_inner]
+        self.dependsOn = set([self.exact_inner])
         self.text_form = RawStream()(self.val)
         return self
     
@@ -86,39 +87,59 @@ class Column:
         right_list = rhs.val if isinstance(rhs.val, list) else [rhs.val]
         result.val = left_list + right_list
         result.exact_inner = lhs.exact_inner if lhs.exact_inner == rhs.exact_inner else None
-        result.dependsOn = lhs.dependsOn + rhs.dependsOn
+        result.dependsOn = lhs.dependsOn | rhs.dependsOn
         return result
     
 class FullContext:
-    def __init__(self, table_node, top_level_tables_inside, columns, unique_column_tuples):
+    def __init__(self, table_node, top_level_tables_inside, columns, unique_column_tuples, sublink_exterior_columns):
         self.table_node: Dict[str, pglast.ast.Node] = table_node
         self.top_level_tables_inside: Dict[str, list] = top_level_tables_inside
         self.columns: Dict[str, Dict[str, Column]] = columns
         self.unique_column_tuples: Dict[str, list] = unique_column_tuples
+        self.sublink_exterior_columns: Dict[str, set[Tuple[str, str]]] = sublink_exterior_columns
         
 class Counter:
     def __init__(self, initial: int = 0):
+        self.initial = initial
         self.counter = initial
 
     def count(self):
         self.counter += 1
         return self.counter
+    
+    def counted(self):
+        return range(self.initial, self.counter + 1)
+    
+def sublink_name(id: int):
+    return SUBLINK + str(id)
 
 def find_depending_columns(ast_node: pglast.ast.Node):
-    """Find all (table, column) in a node, not considering sublink"""
+    class ColumnVisitor(Visitor):
+        def __init__(self):
+            self.dependsOn = set()
+        def visit_ColumnRef(self, _, node):
+            self.dependsOn.add(Column.columnRef_to_exact_inner(node))
+    column_visitor = ColumnVisitor()
+    column_visitor(ast_node)
+    return column_visitor.dependsOn
+
+def find_involved_columns(ast_node: pglast.ast.Node, sublink_exterior_columns: Dict[str, Set[Tuple[str, str]]]):
+    """Find all (table, column) in a node, not including columns of internal tables in sublinks"""
     class FindColumnVisitor(Visitor):
         def __init__(self):
-            self.dependsOn = []
+            self.dependsOn = set()
         def visit_ColumnRef(self, _, node):
-            self.dependsOn.append(Column.columnRef_to_exact_inner(node))
+            self.dependsOn.add(Column.columnRef_to_exact_inner(node))
         def visit_SubLink(self, _, node):
+            id = node.location
+            self.dependsOn |= sublink_exterior_columns[sublink_name(id)]
             return pglast.visitors.Skip()
     find_column_visitor = FindColumnVisitor()
     find_column_visitor(ast_node)
     return find_column_visitor.dependsOn
 
-def find_involved_tables(ast_node: pglast.ast.Node) -> set:
-    depending_columns = find_depending_columns(ast_node)
+def find_involved_tables(ast_node: pglast.ast.Node, sublink_exterior_columns: Dict[str, Set[Tuple[str, str]]]) -> set:
+    depending_columns = find_involved_columns(ast_node, sublink_exterior_columns)
     return set(table_column[0] for table_column in depending_columns)
     
         
@@ -233,3 +254,14 @@ def decompose_predicate(node: pglast.ast.Node):
     decompose_visitor = DecomposeVisitor()
     decompose_visitor(node)
     return decompose_visitor.predicates
+
+def deduplicate_column_by_stream(nodes: List[pglast.ast.Node]):
+    """deduplicate a list of expressions based on RawStream() output"""
+    seen = set()
+    new_nodes = []
+    for node in nodes:
+        text_form = RawStream()(node)
+        if text_form not in seen:
+            seen.add(text_form)
+            new_nodes.append(node)
+    return new_nodes

@@ -1,13 +1,14 @@
 from copy import deepcopy
-from tokenize import group
+import json
 import pglast
 from pglast import parser, parse_sql, Missing
 from pglast.visitors import Visitor
 from top_level_analyzer import TopLevelAnalyzer
-from common import Column, find_involved_tables, connected_component_dfs, ast_BoolExpr, FullContext, AGGREGATE_NAMES, TOP
+from common import Column, deduplicate_column_by_stream, find_involved_tables, connected_component_dfs, ast_BoolExpr, FullContext, AGGREGATE_NAMES, TOP
 from full_analyzer import FullAnalyzer
 from pglast.stream import RawStream
 from typing import Dict
+import itertools
 
 
 class Phase1:
@@ -27,7 +28,7 @@ class Phase1:
     def find_center_tables(self):
         """fill in center_tables"""
         if self.node.groupClause is None:
-            self.center_tables = self.top_level.tables
+            self.center_tables = []
         else:
             center_tables = set()
             for group_column in self.top_level.group_columns:
@@ -78,7 +79,7 @@ class Phase1:
         predicates = self.fetch_all_predicates()
         # construct edges
         for predicate in predicates:
-            involved_tables = find_involved_tables(predicate)
+            involved_tables = find_involved_tables(predicate, self.context.sublink_exterior_columns)
             involved_tables -= center_tables
             for table in involved_tables:
                 edges[table].extend(involved_tables - set([table]))
@@ -100,43 +101,17 @@ class Phase1:
         assert(len(self.top_level.target_columns) == 1)
         column = next(iter(self.top_level.target_columns))
         column_content = self.top_level.target_columns[column].val
-        involved_tables = find_involved_tables(column_content)
+        involved_tables = find_involved_tables(column_content, self.context.sublink_exterior_columns)
         self.relevant_clusters = []
         for cluster in self.clusters:
             if any(table in involved_tables for table in cluster):
                 self.relevant_clusters.append(cluster)
+                continue
             for table_name in cluster:
-                self.remove_table_from_join(table_name)
+                self.top_level.remove_table_from_join(table_name)
                 updated_where_clause = self.predicates_without_table_dfs(
                     pglast.node.Node(self.node).whereClause, table_name)
                 self.node.whereClause = updated_where_clause
-
-    def remove_table_from_join(self, table_name: str):
-        """remove table table_name from JoinExpr in FROM clause"""
-        class RemoveTableVisitor(Visitor):
-            def __init__(self, table_name):
-                self.table_name = table_name
-
-            def visit_JoinExpr(self, _, node):
-                if isinstance(node.larg, pglast.ast.RangeVar):
-                    rangeVar = node.larg
-                    table_name = rangeVar.alias.aliasname if rangeVar.alias else rangeVar.relname
-                    if table_name == self.table_name:
-                        return node.rarg
-                if isinstance(node.rarg, pglast.ast.RangeVar):
-                    rangeVar = node.rarg
-                    table_name = rangeVar.alias.aliasname if rangeVar.alias else rangeVar.relname
-                    if table_name == self.table_name:
-                        return node.larg
-
-            def visit_RangeSubselect(self, _, node):
-                return pglast.visitors.Skip()
-            # do not consider sublink yet
-
-            def visit_SubLink(self, _, node):
-                return pglast.visitors.Skip()
-        remove_table_vistor = RemoveTableVisitor(table_name)
-        remove_table_vistor(self.node)
 
     def predicates_without_table_dfs(self, node: pglast.node.Node, table_name: str):
         """return a modified version of node that eliminates all predicates involving table_name"""
@@ -145,7 +120,7 @@ class Phase1:
         if isinstance(node, pglast.node.Scalar):
             return node.value
         if node.node_tag != "BoolExpr":
-            involved_tables = find_involved_tables(node.ast_node)
+            involved_tables = find_involved_tables(node.ast_node, self.context.sublink_exterior_columns)
             return None if table_name in involved_tables else node.ast_node
         # node is BoolExpr
         args = [self.predicates_without_table_dfs(
@@ -188,13 +163,7 @@ class Phase1:
                     deepcopy(column.val), self.context.columns[center_table])
                 group_clause.append(group_column_node)
         # deduplicate group by columns
-        seen = set()
-        new_group_column_nodes = []
-        for group_column_node in group_clause:
-            text_form = RawStream()(group_column_node)
-            if text_form not in seen:
-                seen.add(text_form)
-                new_group_column_nodes.append(group_column_node)
+        new_group_column_nodes = deduplicate_column_by_stream(group_clause)
         if len(new_group_column_nodes) > 0:
             new_branch.groupClause = new_group_column_nodes
         self.node = new_branch
@@ -249,7 +218,47 @@ class Phase1:
                 return pglast.visitors.Skip()
         aggregate_distinct_visitor = AggregateDistinctVisitor()
         aggregate_distinct_visitor(ast_node)
-    # def check_isolated(self):
+    
+    def check_free_from_center(self):
+        """if the selected column does not involve center tables, and the center tables are totally unrelated to
+           the relevant cluster(s), then we remove the center table and GROUP BY altogether
+           assume center tables and relevant clusters have been calculated
+        """
+        relevant_side_tables = list(itertools.chain(*self.relevant_clusters))
+        remaining_tables = self.center_tables + relevant_side_tables
+        edges = {table: [] for table in remaining_tables}
+        predicates = self.fetch_all_predicates()
+        # construct edges
+        for predicate in predicates:
+            involved_tables = find_involved_tables(predicate, self.context.sublink_exterior_columns)
+            for table in involved_tables:
+                edges[table].extend(involved_tables - set([table]))
+        # find connected components
+        visited = set()
+        clusters = []
+        for table in remaining_tables:
+            if table not in visited:
+                cluster = []
+                connected_component_dfs(table, edges, visited, cluster)
+                clusters.append(cluster)
+        # check if center tables share no clusters with relevant side tables
+        for cluster in clusters:
+            contains_center, contains_side = False, False
+            if any(table in self.center_tables for table in cluster):
+                contains_center = True
+            if any(table in relevant_side_tables for table in cluster):
+                contains_side = True
+            if contains_center and contains_side:
+                return False
+        # remove center tables if they are indeed irrelevant
+        for table_name in self.center_tables:
+            self.remove_table_from_join(table_name)
+            updated_where_clause = self.predicates_without_table_dfs(
+                pglast.node.Node(self.node).whereClause, table_name)
+            self.node.whereClause = updated_where_clause
+        self.node.groupClause = None
+        self.node.sortClause = None
+        return True
 
     def check_idempotent(self):
         """check if the hole is idempotent, i.e. return same thing regardless of whether there is only one
@@ -260,7 +269,7 @@ class Phase1:
         assert(funcCall.funcname[0].val in AGGREGATE_NAMES)
         if funcCall.agg_distinct:
             return True
-        involved_tables = find_involved_tables(node)
+        involved_tables = find_involved_tables(node, self.context.sublink_exterior_columns)
         irrelevant_cluster = 0
         for cluster in self.clusters:
             if all(table not in involved_tables for table in cluster):
@@ -286,16 +295,18 @@ if __name__ == "__main__":
     #     ON D.d1 = C.c2
     #     WHERE B.b1 >= A.a2 AND (A.a1 < A.a1 OR I.x2 < C.c1) OR NOT(D.d1 = C.c2 AND 1 AND B.id < 1 AND E.id = D.id)
     # GROUP BY I.x"""
-    sql = """SELECT COUNT(aa.a1) c1 FROM (SELECT a.a1 FROM a GROUP BY a.a1) aa CROSS JOIN b GROUP BY aa.a1"""
+    # sql = """SELECT COUNT(aa.a1) c1 FROM (SELECT a.a1 FROM a GROUP BY a.a1) aa CROSS JOIN b GROUP BY aa.a1"""
+    # sql = """SELECT COUNT(c.id) c1 FROM a LEFT JOIN b ON a.id = b.id1 CROSS JOIN c GROUP BY a.a1 ORDER BY a.a1, b.id1"""
+    sql = """SELECT COUNT(a.id) c1 FROM a CROSS JOIN b CROSS JOIN c WHERE (SELECT id FROM c c2 WHERE c.id < c2.id) < 10"""
+    with open(schema_file) as file:
+        schema = json.load(file)
 
-    root = pglast.node.Node(parse_sql(sql))
-    node = root[0].stmt
-
-    full_analyzer = FullAnalyzer(sql, schema_file)
+    full_analyzer = FullAnalyzer(sql, schema)
     context = full_analyzer()
-    # node = context.table_node[TOP]
+    node = context.table_node[TOP]
+    node.targetList = [node.targetList[0]]
     # print(RawStream()(node))
-    phase1 = Phase1(node.ast_node, context)
+    phase1 = Phase1(node, context)
     phase1.find_center_tables()
     phase1.find_clusters()
     print(phase1.center_tables, phase1.clusters)
@@ -305,3 +316,6 @@ if __name__ == "__main__":
     zoom = phase1.zoom_in_if_center_one_only()
     if zoom:
         print("after zoom:", RawStream()(phase1.node))
+    free = phase1.check_free_from_center()
+    if free:
+        print("after free:", RawStream()(phase1.node))

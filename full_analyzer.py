@@ -1,11 +1,12 @@
+from copy import deepcopy
 import itertools
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 from numpy import isin
 import pglast
 from pglast import parser, parse_sql, Missing
 from pglast.visitors import Visitor
 import json
-from common import Column, Counter, FullContext, TOP, AGGREGATE_NAMES, add_ast_node_to_select
+from common import Column, Counter, FullContext, TOP, SUBLINK, AGGREGATE_NAMES, add_ast_node_to_select, sublink_name
 from top_level_analyzer import TopLevelAnalyzer
 
 
@@ -17,43 +18,54 @@ class FullAnalyzer:
     Attributes:
         table_node (Dict[str, pglast.node.Node]): table name -> node of subquery/cte
         top_level_tables_inside (Dict[str, list]): table name -> list of top-level tables directly inside
+        sublinks_inside (Dict[str, list]): table name -> list of sublinks_inside directly inside
         columns (Dict[str, Dict[str, Column]]): table name -> dict from column name to Column object
         unique_column_tuples (Dict[str, list]): table name -> list of column names or combination of column names that are unique
+        sublink_context_columns (Dict[str, Dict[str, Column]]): same format as columns, only those tables 
+        in the same scope as the sublink
+        self.sublink_exterior_columns (Dict[str, set[Tuple[str, str]]]): list of exterior columns used in the sublink
         root (pglast.node.Node): root node
-        schema (str): json file name
+        schema: parsed from json
         center_columns (list[list[Tuple[str, str]]]): possibilities for each center column
-        holes (list[pglast.node.Node]): hole id -> function_call
+        sublink_counter (Counter): counter for naming sublinks
     """
-    def __init__(self, sql, schema_file):
+    def __init__(self, sql: str, schema):
         self.table_node: Dict[str, pglast.node.Node] = {}
         self.top_level_tables_inside: Dict[str, list] = {}
+        self.sublinks_inside: Dict[str, list] = {}
         self.columns: Dict[str, Dict[str, Column]] = {}
         self.unique_column_tuples: Dict[str, list] = {}
-        self.root = pglast.Node(parse_sql(sql))
-        with open(schema_file) as file:
-            self.schema = json.load(file)
+        self.sublink_context_columns: Dict[str, Dict[str, Column]] = {}
+        self.sublink_exterior_columns: Dict[str, set[Tuple[str, str]]] = {}
+        self.root = pglast.node.Node(parse_sql(sql))
+        self.schema = schema
         self.center_columns = []
+        self.sublink_counter = Counter()
             
     def __call__(self):
         self.find_hierarchy()
         self.fill_columns_raw()
-        self.fill_columns_dfs(TOP)
+        self.fill_columns_dfs(TOP, [])
         self.find_center_columns()
         table_ast_node = {table: node.ast_node for table, node in self.table_node.items()}
-        return FullContext(table_ast_node, self.top_level_tables_inside, self.columns, self.unique_column_tuples)
+        return FullContext(
+            table_ast_node, 
+            self.top_level_tables_inside, 
+            self.columns, 
+            self.unique_column_tuples, 
+            self.sublink_exterior_columns
+        )
 
     def find_hierarchy(self):
         """fill in top_level_tables_inside and table_node"""
         self.find_hierarchy_dfs(self.root)
         self.fix_alias_hierarchy_dfs(TOP)
-        
 
     def find_hierarchy_dfs(self, node: pglast.node.Base, stack: list = []):
         """fill in top_level_tables_inside and table_node for subqueries/CTE"""
         if isinstance(node, pglast.node.Scalar):
             return
         scope_name = ""
-        # do not consider sublink yet
         sublink = False
         if isinstance(node, pglast.node.Node):
             if node.node_tag == "RangeVar":
@@ -72,15 +84,21 @@ class FullAnalyzer:
                 # not in the main statement anymore
                 stack = []
             elif node.node_tag == "SubLink":
+                sublink_id = self.sublink_counter.count()
+                scope_name = sublink_name(sublink_id)
+                node.ast_node.location = sublink_id
+                self.table_node[scope_name] = node.subselect
+                self.sublink_exterior_columns.setdefault(scope_name, set())
                 sublink = True
         if scope_name != "":
             self.top_level_tables_inside.setdefault(scope_name, [])
+            self.sublinks_inside.setdefault(scope_name, [])
             if len(stack) > 0:
-                self.top_level_tables_inside[stack[-1]].append(scope_name)
+                children_list = self.top_level_tables_inside if not sublink else self.sublinks_inside
+                children_list[stack[-1]].append(scope_name)
             stack.append(scope_name)
         for child in node:
-            if not sublink:
-                self.find_hierarchy_dfs(child, stack)
+            self.find_hierarchy_dfs(child, stack)
         if scope_name != "":
             del stack[-1]
     
@@ -100,6 +118,8 @@ class FullAnalyzer:
             # node.node_tag == "SelectStmt"
             for table in self.top_level_tables_inside[table_name]:
                 self.fix_alias_hierarchy_dfs(table)
+            for table in self.sublinks_inside[table_name]:
+                self.fix_alias_hierarchy_dfs(table)
             
     def fill_columns_raw(self):
         """fill columns and unique_column_tuples of raw tables"""
@@ -116,7 +136,7 @@ class FullAnalyzer:
             for other in table['Others']:
                 self.columns[table_name][other['Name']] = Column.create(table_name, other['Name'])  
     
-    def fill_columns_dfs(self, table_name):
+    def fill_columns_dfs(self, table_name, inside_sublinks: List[str]):
         """fill columns and unique_column_tuples of intermediate tables
            SIDE EFFECTS:
            replace SELECT * with actual columns
@@ -137,32 +157,36 @@ class FullAnalyzer:
             self.unique_column_tuples[table_name] = self.unique_column_tuples[relname]
             return
         # Case 2: SelectStmt
-        top_level_tables = self.top_level_tables_inside[table_name]
-        for top_level_table in top_level_tables:
+        sublink_context_columns = {}
+        for top_level_table in self.top_level_tables_inside[table_name]:
             if top_level_table not in self.columns:
-                self.fill_columns_dfs(top_level_table)
+                self.fill_columns_dfs(top_level_table, inside_sublinks)
+            sublink_context_columns[top_level_table] = self.columns[top_level_table]
+        for sublink in self.sublinks_inside[table_name]:
+            self.sublink_context_columns[sublink] = sublink_context_columns
+            self.fill_columns_dfs(sublink, inside_sublinks + [sublink])
         
-        self.fill_columns(table_name)
+        self.fill_columns(table_name, inside_sublinks)
         self.fill_unique_column_tuples(table_name)
         if len(self.unique_column_tuples[table_name]) == 0:
             print("Warning: table", table_name, "has no primary key")
 
-    def fill_columns(self, table_name):
+    def fill_columns(self, table_name, inside_sublinks: List[str]):
         """helper function of fill_columns_dfs, fill columns for this table"""
         node = self.table_node[table_name]
         top_level_tables = self.top_level_tables_inside[table_name]
         # fill in columns
         # in case of set operations, i.e. UNION/INTERCECT/EXCEPT, analyze each
         # and combine the results
-        self.columns[table_name] = self.fill_columns_combine_sets_dfs(node, top_level_tables)
+        self.columns[table_name] = self.fill_columns_combine_sets_dfs(node, top_level_tables, inside_sublinks)
         
         
-    def fill_columns_combine_sets_dfs(self, node: pglast.node.Node, top_level_tables: list):
+    def fill_columns_combine_sets_dfs(self, node: pglast.node.Node, top_level_tables: list, inside_sublinks: List[str]):
         """helper function of fill_column, combining results of single sets"""
         if node.op.value == pglast.enums.parsenodes.SetOperation.SETOP_NONE:
-            return self.fill_columns_single_set(node, top_level_tables)
-        left = self.fill_columns_combine_sets_dfs(node.larg, top_level_tables)
-        right = self.fill_columns_combine_sets_dfs(node.rarg, top_level_tables)
+            return self.fill_columns_single_set(node, top_level_tables, inside_sublinks)
+        left = self.fill_columns_combine_sets_dfs(node.larg, top_level_tables, inside_sublinks)
+        right = self.fill_columns_combine_sets_dfs(node.rarg, top_level_tables, inside_sublinks)
         # column list should be same length
         assert(len(left) == len(right))
         # rely on the fact that dict type maintains insertion order by default
@@ -174,7 +198,7 @@ class FullAnalyzer:
             result[left_name] = Column.merge(left[left_name], right[right_name])
         return result
     
-    def fill_columns_single_set(self, node: pglast.node.Node, top_level_tables: list):
+    def fill_columns_single_set(self, node: pglast.node.Node, top_level_tables: list, inside_sublinks: List[str]):
         """fill in target_columns for the current scope
            replace SELECT * with actual columns
            qualify columns with the inner tables they come from
@@ -187,15 +211,16 @@ class FullAnalyzer:
                 for column in self.columns[top_level_table]:
                     new_target_list.append(Column.name_to_resTarget(top_level_table, column))
             node.ast_node.targetList = new_target_list
-        self.qualify_columns_from_inner_table(node, top_level_tables)
+        self.qualify_columns_from_inner_table(node, top_level_tables, inside_sublinks)
         result = {}
         for target in node.targetList:
             column_name = Column.name_from_resTarget(target.ast_node)
             result[column_name] = Column.from_ast_node(target.val.ast_node, column_name)
         return result
     
-    def qualify_columns_from_inner_table(self, node: pglast.node.Node, top_level_tables: list):
+    def qualify_columns_from_inner_table(self, node: pglast.node.Node, top_level_tables: list, inside_sublinks: List[str]):
         """qualify columns with the inner tables they come from, i.e. c -> t.c"""
+        # find all column names we recognize
         # column name from inner table -> ColumnRef with fields (inner table, column)
         qualified_columnRef = {}
         repeated_names = set()
@@ -203,27 +228,58 @@ class FullAnalyzer:
             for column in self.columns[top_level_table]:
                 if column in qualified_columnRef:
                     repeated_names.add(column)
+                # ColumnRef ast node
                 qualified_columnRef[column] = Column.create(top_level_table, column).val
-                
+        # used when parsing sublinks
+        qualified_exterior_columnRef = {}
+        repeated_exterior_names = set()
+        table_due_to_sublink = {}
+        for sublink in inside_sublinks:
+            sublink_context_columns = self.sublink_context_columns[sublink]
+            for exterior_table in sublink_context_columns:
+                table_due_to_sublink[exterior_table] = sublink
+                for column in sublink_context_columns[exterior_table]:
+                    if column in qualified_exterior_columnRef:
+                        repeated_exterior_names.add(column)
+                    qualified_exterior_columnRef[column] = Column.create(top_level_table, column).val
+        
         class QualifyVisitor(Visitor):
-            def __init__(self, qualified_columnRef, repeated_names):
-                self.qualified_columnRef = qualified_columnRef
-                self.repeated_names = repeated_names
+            def __init__(self, sublink_exterior_columns):
+                self.sublink_exterior_columns = sublink_exterior_columns
             def visit_ColumnRef(self, ancestor, node):
-                if len(node.fields) == 1 and node.fields[0].val in self.qualified_columnRef:
+                new_node = deepcopy(node)
+                if len(node.fields) == 1:
+                   # need to qualify with table name
                     column = node.fields[0].val
-                    if column in self.repeated_names:
-                        raise Exception(f"Column reference {column} is ambiguous without specifying table")
-                    return self.qualified_columnRef[column]
-                return None
+                    # first try to resolve without using exterior context
+                    if column in qualified_columnRef:
+                        if column in repeated_names:
+                            raise Exception(f"Column reference {column} is ambiguous without specifying table")
+                        new_node = qualified_columnRef[column]
+                    elif column in qualified_exterior_columnRef:
+                        if column in repeated_exterior_names:
+                            raise Exception(f"Column reference {column} is ambiguous without specifying table")
+                        new_node = qualified_exterior_columnRef[column]
+                    else:
+                        raise Exception(f"Column reference {column} cannot be resolved")
+                assert(len(new_node.fields) == 2)
+                table, column = new_node.fields[0].val, new_node.fields[1].val
+                if table in table_due_to_sublink:
+                    # the outermost sublink that will consider this column exterior
+                    due_to_sublink = table_due_to_sublink[table]
+                    index = inside_sublinks.index(due_to_sublink)
+                    for sublink in inside_sublinks[index:]:
+                        self.sublink_exterior_columns[sublink].add((table, column))
+                return new_node
+            def visit_SortBy(self, _, node):
+                return pglast.visitors.Skip()
             def visit_RangeSubselect(self, _, node):
                 return pglast.visitors.Skip()
             # do not consider sublink yet
             def visit_SubLink(self, _, node):
                 return pglast.visitors.Skip() 
-        qualify_visitor = QualifyVisitor(qualified_columnRef, repeated_names)
+        qualify_visitor = QualifyVisitor(self.sublink_exterior_columns)
         qualify_visitor(node.ast_node)
-        
 
     def fill_unique_column_tuples(self, table_name):
         """helper function of fill_columns_dfs, fill unique_column_tuples for this table
@@ -238,7 +294,7 @@ class FullAnalyzer:
                 inner_columns[column_obj.exact_inner] = column_name
         # fill in unique_column_tuples
         if node.groupClause is not Missing:
-            self.unique_column_tuples[table_name] = self.find_group_by_unique_tuples(node, inner_columns)
+            self.unique_column_tuples[table_name] = self.find_group_by_unique_tuples(table_name, inner_columns)
         elif node.distinctClause is not Missing:
             self.unique_column_tuples[table_name] = [list(self.columns[table_name])]
         elif node.op.value == pglast.enums.parsenodes.SetOperation.SETOP_UNION:
@@ -248,7 +304,6 @@ class FullAnalyzer:
             # nothing to guarentee uniqueness, so we use the cartesian product of child unique tuples
             candidate_tuples = self.cartesian_of_child_unique_tuples(
                 self.top_level_tables_inside[table_name],
-                self.columns[table_name],
                 self.unique_column_tuples
             )
             # if a candidate tuple is a subset of what we select, accept it
@@ -257,7 +312,9 @@ class FullAnalyzer:
                     candidate_tuple = [inner_columns[column] for column in candidate_tuple]
                     self.unique_column_tuples[table_name].append(candidate_tuple)
     
-    def find_group_by_unique_tuples(self, node: pglast.node.Node, inner_columns: Dict[Tuple[str, str], str]):
+    def find_group_by_unique_tuples(self, table_name: str, inner_columns: Dict[Tuple[str, str], str]):
+        """helper function to fill_unique_column_tuples"""
+        node = self.table_node[table_name]
         cartesian_components = []
         top_level_analyzer = TopLevelAnalyzer(node.ast_node)
         top_level_analyzer.find_target_columns()
@@ -275,6 +332,7 @@ class FullAnalyzer:
             elif group_column.exact_inner is None:
                 column_name = "groupby_column_" + str(counter.count())
                 add_ast_node_to_select(node.ast_node, group_column.val, column_name)
+                self.columns[table_name][column_name] = Column.from_ast_node(group_column.val, column_name)
                 cartesian_components.append([[column_name]])
         # for exact group-by columns belonging to the same child table, try to eliminate some with unique info
         # i.e. find all child unique tuples for each child table that is a subset of the group-by columns
@@ -304,6 +362,7 @@ class FullAnalyzer:
                     else:
                         column_name = "groupby_column_" + str(counter.count())
                         add_ast_node_to_select(node.ast_node, Column.create(table, column).val, column_name)
+                        self.columns[table_name][column_name] = Column.create(table, column)
                         outer_column_names.append(column_name)
                 cartesian_component.append(outer_column_names)
             cartesian_components.append(cartesian_component)
@@ -312,12 +371,8 @@ class FullAnalyzer:
     
     
     @staticmethod                
-    def cartesian_of_child_unique_tuples(top_level_tables: list, columns: Dict[str, Column], unique_column_tuples: Dict[str, list]):
+    def cartesian_of_child_unique_tuples(top_level_tables: list, unique_column_tuples: Dict[str, list]):
         # find all columns we select that are exactly from an inner table
-        inner_columns = {}
-        for column_name, column_obj in columns.items():
-            if column_obj.exact_inner:
-                inner_columns[column_obj.exact_inner] = column_name
         cartesian_components = []
         for table in top_level_tables:
             tabled_unique_tuples = []
@@ -359,12 +414,12 @@ class FullAnalyzer:
         """helper function of find_center_columns"""
         scope, name = exact_inner
         column = self.column_object(*exact_inner)
-        columns_to_explore = []
+        columns_to_explore = set()
         if column.exact_inner is not None:
             if len(self.top_level_tables_inside[scope]) == 0:
                 # reached raw table
                 return [column.exact_inner]
-            columns_to_explore = [column.exact_inner]
+            columns_to_explore.add(column.exact_inner)
         else: 
             print(f"Warning: Column {name} is not exactly a column from an inner table")
             columns_to_explore = column.dependsOn
@@ -377,10 +432,13 @@ class FullAnalyzer:
 if __name__ == "__main__":           
     schema_file = "testschema.json"
     # sql = """WITH cte AS (SELECT 1 as cst1, a.a1 as a1 FROM a) SELECT (SELECT 3 FROM d) k2, a2.a + 1 k2 FROM c c2 CROSS JOIN (SELECT * FROM a) as a2 WHERE EXISTS (SELECT 3 FROM d)"""
-    sql = "SELECT a1 col FROM a CROSS JOIN b GROUP BY ABS(b.b1), a.id, a.a1"
-    analyzer = FullAnalyzer(sql, schema_file)
+    sql = "SELECT (SELECT 1 n1 FROM c WHERE a.a1 > 1) bruh FROM a WHERE (SELECT 2 n2 FROM b WHERE (SELECT 3 n3 FROM c WHERE b.b1 < c.c1 AND a.a1 < 1)) = 1"
+    with open(schema_file) as file:
+        schema = json.load(file)
+    analyzer = FullAnalyzer(sql, schema)
     analyzer()
     from pglast.stream import RawStream
     print(analyzer.columns)
     print(analyzer.unique_column_tuples)
+    print(analyzer.sublink_exterior_columns)
     print(RawStream()(analyzer.table_node[TOP]))

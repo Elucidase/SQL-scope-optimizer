@@ -1,7 +1,7 @@
 import pglast
 from pglast import parse_sql
 from pglast.visitors import Visitor
-from typing import Dict, Tuple
+from typing import Dict, Set, Tuple
 from pglast.enums.nodes import JoinType
 from prometheus_client import Counter
 from common import Column, check_null_sensitive_dfs, find_involved_tables, decompose_predicate, reversed_graph, AGGREGATE_NAMES, Counter
@@ -51,7 +51,7 @@ class TopLevelAnalyzer:
                 self.top_level_tables.append(node.alias.aliasname)
                 return pglast.visitors.Skip()
             # do not consider SubLink yet
-            def visit_SubLink(self):
+            def visit_SubLink(self, _, node):
                 return pglast.visitors.Skip()
         visitor = TopLevelTableVisitor()
         visitor(self.node)
@@ -120,7 +120,7 @@ class TopLevelAnalyzer:
             if self.node.whereClause is not None:
                 replace_visitor(self.node.whereClause)
     
-    def find_null_graph_and_safety(self):
+    def find_null_graph_and_safety(self, sublink_exterior_columns: Dict[str, Set[Tuple[str, str]]]):
         """find null-graph
            Assume no raw table contains a record with NULL in all its fields,
            so if a record of an intermediate table has NULL in all fields of a relation, 
@@ -140,13 +140,13 @@ class TopLevelAnalyzer:
            LEFT or INNER JOIN where the said ancestor acts as the left side of the join. 
         """
         edges = {table: [] for table in self.tables}
-        safety = self.construct_null_edges_from_join_dfs(self.node.fromClause[0], edges)
+        safety = self.construct_null_edges_from_join_dfs(self.node.fromClause[0], edges, sublink_exterior_columns)
         # construct edges from WHERE clause
         predicates = decompose_predicate(self.node.whereClause)
         for predicate in predicates:
             if not check_null_sensitive_dfs(pglast.node.Node(predicate)):
                 continue
-            involved_tables = find_involved_tables(predicate)
+            involved_tables = find_involved_tables(predicate, sublink_exterior_columns)
             # construct edges in both directions
             for table in involved_tables:
                 safety[table] = True
@@ -170,7 +170,7 @@ class TopLevelAnalyzer:
                 populate_safety_dfs(table)
 
     @staticmethod
-    def construct_null_edges_from_join_dfs(node: pglast.ast.Node, edges: Dict[str, list]):
+    def construct_null_edges_from_join_dfs(node: pglast.ast.Node, edges: Dict[str, list], sublink_exterior_columns):
         """add edges by examining ON predicates
            returns dict of table_name -> whether it is safe
         """
@@ -181,8 +181,8 @@ class TopLevelAnalyzer:
             table_name = node.alias.aliasname
             return {table_name: True}
         assert(isinstance(node, pglast.ast.JoinExpr))
-        left_safety = TopLevelAnalyzer.construct_null_edges_from_join_dfs(node.larg, edges)
-        right_safety = TopLevelAnalyzer.construct_null_edges_from_join_dfs(node.rarg, edges)
+        left_safety = TopLevelAnalyzer.construct_null_edges_from_join_dfs(node.larg, edges, sublink_exterior_columns)
+        right_safety = TopLevelAnalyzer.construct_null_edges_from_join_dfs(node.rarg, edges, sublink_exterior_columns)
         safety = {**left_safety, **right_safety}
         # left/right/full join may cause tables to become unsafe
         if node.jointype in (JoinType.JOIN_LEFT, JoinType.JOIN_FULL):
@@ -194,7 +194,7 @@ class TopLevelAnalyzer:
         # null-sensitive predicate in ON can help with null-graph and safety
         if node.quals is None or not check_null_sensitive_dfs(pglast.node.Node(node.quals)):
             return safety
-        involved_tables = find_involved_tables(node.quals)
+        involved_tables = find_involved_tables(node.quals, sublink_exterior_columns)
         left_involved = [table for table in involved_tables if table in left_safety]
         right_involved = [table for table in involved_tables if table in right_safety]
         # ta -> tb means (all ta fields are null implies all tb fields are NULL)
@@ -233,6 +233,32 @@ class TopLevelAnalyzer:
         hole_visitor = HoleVisitor()
         hole_visitor(self.node)
         return hole_visitor.holes
+    
+    def remove_table_from_join(self, table_name: str):
+        """remove table table_name from JoinExpr in FROM clause"""
+        class RemoveTableVisitor(Visitor):
+            def __init__(self, table_name):
+                self.table_name = table_name
+
+            def visit_JoinExpr(self, _, node):
+                if isinstance(node.larg, pglast.ast.RangeVar):
+                    rangeVar = node.larg
+                    table_name = rangeVar.alias.aliasname if rangeVar.alias else rangeVar.relname
+                    if table_name == self.table_name:
+                        return node.rarg
+                if isinstance(node.rarg, pglast.ast.RangeVar):
+                    rangeVar = node.rarg
+                    table_name = rangeVar.alias.aliasname if rangeVar.alias else rangeVar.relname
+                    if table_name == self.table_name:
+                        return node.larg
+
+            def visit_RangeSubselect(self, _, node):
+                return pglast.visitors.Skip()
+            # do not consider sublink yet
+            def visit_SubLink(self, _, node):
+                return pglast.visitors.Skip()
+        remove_table_vistor = RemoveTableVisitor(table_name)
+        remove_table_vistor(self.node)
         
     
 if __name__ == "__main__":           
