@@ -4,7 +4,7 @@ from pglast.enums.primnodes import BoolExprType
 from pglast.enums.parsenodes import A_Expr_Kind
 from typing import Dict, List
 from pglast.stream import RawStream
-from common import Counter
+from common import FALSE_NODE, TRUE_NODE, Counter
 
 
 class Variable:
@@ -20,10 +20,9 @@ def construct_formula_from_ast_node(expr: pglast.ast.Node):
     """return formula for the given ast node"""
     vars = {}
     # TRUE/FALSE literal
-    type_name = typeName=pglast.ast.TypeName(
-        names=(pglast.ast.String('pg_catalog'), pglast.ast.String('bool')), setof=False, pct_type=False, typemod=-1)
-    vars['true'] = Variable(pglast.ast.TypeCast(arg=pglast.ast.A_Const(val=pglast.ast.String('t')), typeName=type_name), bool)
-    vars['false'] = Variable(pglast.ast.TypeCast(arg=pglast.ast.A_Const(val=pglast.ast.String('f')), typeName=type_name), bool)
+    
+    vars['true'] = Variable(TRUE_NODE, bool)
+    vars['false'] = Variable(FALSE_NODE, bool)
     var_strings = {}
     counter = Counter()
     formula_string, _ = construct_formula_dfs(
@@ -36,7 +35,8 @@ def register_new_var(expr: pglast.ast.Node, type: type, vars: Dict[str, Variable
     """Register a new (int) variable if it hasn't been created
     Deduplicate by comparing their RawStream string representation
     """
-    var_string = RawStream()(expr)
+    type_name = "int" if type is int else "bool"
+    var_string = RawStream()(expr) + type_name
     if var_string in var_strings:
         return var_strings[var_string]
     var_name = pglast.node.Node(expr).node_tag + str(counter.count())
@@ -78,7 +78,7 @@ def construct_formula_dfs(expr: pglast.ast.Node, expected_type: type, vars: Dict
             result_str = f"({left_str} {op} {right_str})"
             if left_type is not int or right_type is not int:
                 raise Exception(f"argument of {result_str} is bogus")
-            if op in ("=", "!=", "<", ">", "<=", ">="):
+            if op in ("==", "!=", "<", ">", "<=", ">="):
                 return result_str, bool
             elif op in ("+", "-", "*", "/"):
                 return result_str, int
@@ -152,8 +152,8 @@ def construct_ast_node_from_formula_dfs(formula: z3.BoolRef, vars: Dict[str, Var
 
 
 def convert_formula_to_cnf(formula: z3.BoolRef):
-    cnf_tactic = z3.Then(z3.Tactic('tseitin-cnf'),
-                         z3.Tactic('ctx-solver-simplify'))
+    tseitin_cnf = z3.With(z3.Tactic('tseitin-cnf'), local_ctx=True)
+    cnf_tactic = z3.Then(tseitin_cnf, z3.Tactic('ctx-solver-simplify'))
     goal = z3.Goal()
     goal.add(formula)
     return cnf_tactic(goal).as_expr()
@@ -161,11 +161,14 @@ def convert_formula_to_cnf(formula: z3.BoolRef):
 
 def simplify_formula(formula: z3.BoolRef):
     simplify_tactic = z3.Repeat(
-        z3.OrElse(
-            z3.Then(z3.Tactic('split-clause'),
-                    z3.Tactic('ctx-solver-simplify')),
-            z3.Tactic('skip')
+        z3.Then(
+            z3.Tactic('ctx-solver-simplify'),
+            z3.OrElse(
+                z3.Tactic('propagate-values'),
+                z3.Tactic('propagate-ineqs')
+            )
         )
+        
     )
     goal = z3.Goal()
     goal.add(formula)

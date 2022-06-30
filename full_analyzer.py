@@ -8,6 +8,7 @@ from pglast.visitors import Visitor
 import json
 from common import Column, Counter, FullContext, TOP, SUBLINK, AGGREGATE_NAMES, add_ast_node_to_select, sublink_name
 from top_level_analyzer import TopLevelAnalyzer
+from pglast.stream import RawStream
 
 
 # Assumptions
@@ -47,6 +48,7 @@ class FullAnalyzer:
         self.fill_columns_raw()
         self.fill_columns_dfs(TOP, [])
         self.find_center_columns()
+        self.table_node[TOP].ast_node.withClause = None
         table_ast_node = {table: node.ast_node for table, node in self.table_node.items()}
         return FullContext(
             table_ast_node, 
@@ -152,7 +154,7 @@ class FullAnalyzer:
             if table_name == relname:
                 raise Exception(f"Raw table '{table_name}' not in spec!")
             if relname not in self.columns:
-                self.fill_columns_dfs(relname)
+                self.fill_columns_dfs(relname, inside_sublinks)
             self.columns[table_name] = self.columns[relname]
             self.unique_column_tuples[table_name] = self.unique_column_tuples[relname]
             return
@@ -178,15 +180,15 @@ class FullAnalyzer:
         # fill in columns
         # in case of set operations, i.e. UNION/INTERCECT/EXCEPT, analyze each
         # and combine the results
-        self.columns[table_name] = self.fill_columns_combine_sets_dfs(node, top_level_tables, inside_sublinks)
+        self.columns[table_name] = self.fill_columns_combine_sets_dfs(node, inside_sublinks)
         
         
-    def fill_columns_combine_sets_dfs(self, node: pglast.node.Node, top_level_tables: list, inside_sublinks: List[str]):
+    def fill_columns_combine_sets_dfs(self, node: pglast.node.Node, inside_sublinks: List[str]):
         """helper function of fill_column, combining results of single sets"""
         if node.op.value == pglast.enums.parsenodes.SetOperation.SETOP_NONE:
-            return self.fill_columns_single_set(node, top_level_tables, inside_sublinks)
-        left = self.fill_columns_combine_sets_dfs(node.larg, top_level_tables, inside_sublinks)
-        right = self.fill_columns_combine_sets_dfs(node.rarg, top_level_tables, inside_sublinks)
+            return self.fill_columns_single_set(node, inside_sublinks)
+        left = self.fill_columns_combine_sets_dfs(node.larg, inside_sublinks)
+        right = self.fill_columns_combine_sets_dfs(node.rarg, inside_sublinks)
         # column list should be same length
         assert(len(left) == len(right))
         # rely on the fact that dict type maintains insertion order by default
@@ -198,20 +200,22 @@ class FullAnalyzer:
             result[left_name] = Column.merge(left[left_name], right[right_name])
         return result
     
-    def fill_columns_single_set(self, node: pglast.node.Node, top_level_tables: list, inside_sublinks: List[str]):
+    def fill_columns_single_set(self, node: pglast.node.Node, inside_sublinks: List[str]):
         """fill in target_columns for the current scope
            replace SELECT * with actual columns
            qualify columns with the inner tables they come from
         """
         firstVal = node.targetList[0].val
+        top_level = TopLevelAnalyzer(node.ast_node)
+        top_level.find_top_level_tables()
         # if SELECT *, then SELECT all columns from all inner tables
         if firstVal.node_tag == "ColumnRef" and isinstance(firstVal.fields[0].ast_node, pglast.ast.A_Star):
             new_target_list = []
-            for top_level_table in top_level_tables:
+            for top_level_table in top_level.tables:
                 for column in self.columns[top_level_table]:
                     new_target_list.append(Column.name_to_resTarget(top_level_table, column))
             node.ast_node.targetList = new_target_list
-        self.qualify_columns_from_inner_table(node, top_level_tables, inside_sublinks)
+        self.qualify_columns_from_inner_table(node, top_level.tables, inside_sublinks)
         result = {}
         for target in node.targetList:
             column_name = Column.name_from_resTarget(target.ast_node)
@@ -294,7 +298,11 @@ class FullAnalyzer:
                 inner_columns[column_obj.exact_inner] = column_name
         # fill in unique_column_tuples
         if node.groupClause is not Missing:
-            self.unique_column_tuples[table_name] = self.find_group_by_unique_tuples(table_name, inner_columns)
+            self.unique_column_tuples[table_name] = self.find_group_by_unique_tuples(
+                self.table_node[table_name],
+                self.columns[table_name],
+                self.unique_column_tuples
+            )
         elif node.distinctClause is not Missing:
             self.unique_column_tuples[table_name] = [list(self.columns[table_name])]
         elif node.op.value == pglast.enums.parsenodes.SetOperation.SETOP_UNION:
@@ -312,9 +320,13 @@ class FullAnalyzer:
                     candidate_tuple = [inner_columns[column] for column in candidate_tuple]
                     self.unique_column_tuples[table_name].append(candidate_tuple)
     
-    def find_group_by_unique_tuples(self, table_name: str, inner_columns: Dict[Tuple[str, str], str]):
+    @staticmethod
+    def find_group_by_unique_tuples(node: pglast.node.Node, columns: Dict[str, Column], unique_column_tuples: Dict[str, list]):
         """helper function to fill_unique_column_tuples"""
-        node = self.table_node[table_name]
+        inner_columns = {}
+        for column_name, column_obj in columns.items():
+            if column_obj.exact_inner:
+                inner_columns[column_obj.exact_inner] = column_name
         cartesian_components = []
         top_level_analyzer = TopLevelAnalyzer(node.ast_node)
         top_level_analyzer.find_target_columns()
@@ -332,7 +344,7 @@ class FullAnalyzer:
             elif group_column.exact_inner is None:
                 column_name = "groupby_column_" + str(counter.count())
                 add_ast_node_to_select(node.ast_node, group_column.val, column_name)
-                self.columns[table_name][column_name] = Column.from_ast_node(group_column.val, column_name)
+                columns[column_name] = Column.from_ast_node(group_column.val, column_name)
                 cartesian_components.append([[column_name]])
         # for exact group-by columns belonging to the same child table, try to eliminate some with unique info
         # i.e. find all child unique tuples for each child table that is a subset of the group-by columns
@@ -343,7 +355,7 @@ class FullAnalyzer:
             cartesian_component = []
             group_columns_about_this_child = by_table[table]
             subsets = [group_columns_about_this_child]
-            for unique_tuple in self.unique_column_tuples[table]:
+            for unique_tuple in unique_column_tuples[table]:
                 if all(column in group_columns_about_this_child for column in unique_tuple):
                     subsets.append(unique_tuple)
             # has proper subset, don't need the full one
@@ -362,12 +374,33 @@ class FullAnalyzer:
                     else:
                         column_name = "groupby_column_" + str(counter.count())
                         add_ast_node_to_select(node.ast_node, Column.create(table, column).val, column_name)
-                        self.columns[table_name][column_name] = Column.create(table, column)
+                        columns[column_name] = Column.create(table, column)
                         outer_column_names.append(column_name)
                 cartesian_component.append(outer_column_names)
             cartesian_components.append(cartesian_component)
         product = itertools.product(*cartesian_components)
         return [list(itertools.chain.from_iterable(cols)) for cols in product]
+    
+    @staticmethod
+    def minimal_equidependent_subset(
+        root: pglast.ast.Node, 
+        node_list: List[pglast.ast.Node], 
+        unique_column_tuples: Dict[str, list]
+    ):
+        """gives a minimal subset of node_list on which no less columns that are functionally dependent
+           note that it takes in ast nodes
+        """
+        root = deepcopy(root)
+        root.groupClause = node_list
+        top_level = TopLevelAnalyzer(root)
+        top_level()
+        columns = top_level.target_columns
+        unique_column_tuples = deepcopy(unique_column_tuples)
+        candidate_subsets = FullAnalyzer.find_group_by_unique_tuples(pglast.node.Node(root), columns, unique_column_tuples)
+        subsets = [[columns[name].val for name in subset] for subset in candidate_subsets]
+        return subsets
+        
+        
     
     
     @staticmethod                

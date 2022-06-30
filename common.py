@@ -8,6 +8,13 @@ from pglast.stream import RawStream
 TOP = "%top%"
 SUBLINK = "%sublink%"
 AGGREGATE_NAMES = ["count", "sum", "min", "max", "avg"]
+HOLE_AGG_NAME = "agg"
+TRUE_NODE = pglast.ast.TypeCast(arg=pglast.ast.A_Const(val=pglast.ast.String('t')), typeName=pglast.ast.TypeName(
+    names=(pglast.ast.String('pg_catalog'), pglast.ast.String('bool')), setof=False, pct_type=False, typemod=-1))
+FALSE_NODE = pglast.ast.TypeCast(arg=pglast.ast.A_Const(val=pglast.ast.String('f')), typeName=pglast.ast.TypeName(
+    names=(pglast.ast.String('pg_catalog'), pglast.ast.String('bool')), setof=False, pct_type=False, typemod=-1))
+SELECT_SUM_ZERO = pglast.parse_sql(f"SELECT SUM(0) {HOLE_AGG_NAME}")[0].stmt
+SELECT_EMPTY = pglast.parse_sql("SELECT")[0].stmt
 
 class Column:
     """
@@ -97,6 +104,26 @@ class FullContext:
         self.columns: Dict[str, Dict[str, Column]] = columns
         self.unique_column_tuples: Dict[str, list] = unique_column_tuples
         self.sublink_exterior_columns: Dict[str, set[Tuple[str, str]]] = sublink_exterior_columns
+    
+class TranslationPayload:
+    def __init__(self, links: Dict[str, pglast.ast.Node] = None, value_map: Dict[Tuple[str, str], pglast.ast.Node] = None):
+        self.links: dict[str, pglast.ast.Node] = links
+        self.value_map: dict[Tuple[str, str], pglast.ast.Node] = value_map
+        
+    def update(self, translate_map: Dict[Tuple[str, str], pglast.ast.Node]):
+        # update links
+        if self.links is not None:
+            for origin_str, key_outer in self.links.items():
+                translated = translate(key_outer, translate_map)
+                self.links[origin_str] = translated
+        # update value_map
+        if self.value_map is not None:
+            new_value_map = {}
+            for column, node_outer in self.value_map.items():
+                translated = translate(node_outer, translate_map)
+                if translated is not None:
+                    new_value_map[column] = translated
+            self.value_map = new_value_map
         
 class Counter:
     def __init__(self, initial: int = 0):
@@ -130,6 +157,8 @@ def find_involved_columns(ast_node: pglast.ast.Node, sublink_exterior_columns: D
             self.dependsOn = set()
         def visit_ColumnRef(self, _, node):
             self.dependsOn.add(Column.columnRef_to_exact_inner(node))
+        def visit_RangeSubselect(self, _, node):
+            return pglast.visitors.Skip()
         def visit_SubLink(self, _, node):
             id = node.location
             self.dependsOn |= sublink_exterior_columns[sublink_name(id)]
@@ -141,6 +170,34 @@ def find_involved_columns(ast_node: pglast.ast.Node, sublink_exterior_columns: D
 def find_involved_tables(ast_node: pglast.ast.Node, sublink_exterior_columns: Dict[str, Set[Tuple[str, str]]]) -> set:
     depending_columns = find_involved_columns(ast_node, sublink_exterior_columns)
     return set(table_column[0] for table_column in depending_columns)
+
+def translate(node: pglast.ast.Node, translate_map: Dict[Tuple[str, str], pglast.ast.Node]):
+    """replace outer table column into inner column
+        if we cannot translate, return None
+    """
+    class InterpretVisitor(Visitor):
+        def __init__(self, translate_map):
+            self.translate_map = translate_map
+
+        def visit_ColumnRef(self, _, node):
+            assert(len(node.fields) == 2)
+            column = Column.columnRef_to_exact_inner(node)
+            if column in self.translate_map:
+                if self.translate_map[column] == None:
+                    # cannot translate
+                    raise Exception(f"Cannot translate column {column[0]}.{column[1]}")
+                return self.translate_map[column]
+            return None
+        def visit_SortBy(self, _, node):
+            return pglast.visitors.Skip()
+    # dummy node needed to be able to replace itself entirely
+    dummy_node = pglast.ast.ResTarget(val=node)
+    interpret_visitor = InterpretVisitor(translate_map)
+    try:
+        interpret_visitor(dummy_node)
+    except:
+        return None
+    return dummy_node.val
     
         
 def connected_component_dfs(vertex, edges: Dict[str, list], visited: Set, component: list):
@@ -255,7 +312,7 @@ def decompose_predicate(node: pglast.ast.Node):
     decompose_visitor(node)
     return decompose_visitor.predicates
 
-def deduplicate_column_by_stream(nodes: List[pglast.ast.Node]):
+def deduplicate_nodes_by_stream(nodes: List[pglast.ast.Node]):
     """deduplicate a list of expressions based on RawStream() output"""
     seen = set()
     new_nodes = []

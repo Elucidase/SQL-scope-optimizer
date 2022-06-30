@@ -9,38 +9,40 @@ from full_analyzer import FullAnalyzer, FullContext
 from typing import Dict, Set, Tuple, List
 from pglast.stream import RawStream
 from copy import deepcopy
-from common import TOP, find_involved_tables, add_predicates_to_where, ast_BoolExpr
+from common import SELECT_SUM_ZERO, TOP, deduplicate_nodes_by_stream, find_involved_tables, add_predicates_to_where, ast_BoolExpr
 from pglast_z3 import construct_formula_from_ast_node, construct_ast_node_from_formula_dfs, convert_formula_to_cnf, simplify_formula
 import z3
 
 
 class Phase2:
-    def __init__(self, node: pglast.ast.Node, context: FullContext, center_tables: list):
+    def __init__(self, node: pglast.ast.Node, context: FullContext):
         if not isinstance(node, pglast.ast.Node):
             raise Exception("ToplevelAnalyzer accepts ast.Node, not node.Node")
         self.node: pglast.ast.Node = node
         self.context: FullContext = context
         self.top_level: TopLevelAnalyzer = TopLevelAnalyzer(node)
-        self.center_tables: list[str] = center_tables
         self.outer_tables: list[str] = None
         # init
         self.top_level()
         
-    def find_outer_table(self):
+    def find_outer_tables(self):
         """find outer tables, which will be used to determine whether a predicate "crosses"
         """
-        if len(self.center_tables) == 0 or len(self.center_tables) == len(self.top_level.tables):
+        center_tables = self.top_level.find_center_tables()
+        if len(center_tables) == 0 or len(center_tables) == len(self.top_level.tables):
             # no center table or everything is center table
-            tables_in_hole = find_involved_tables(self.node.targetList[0], self.context.sublink_exterior_columns)
-            tables_not_in_hole = set(self.top_level.tables) - set(tables_in_hole)
-            if len(tables_not_in_hole) == 0:
+            involved_tables = set()
+            for column in self.top_level.target_columns.values():
+                involved_tables |= find_involved_tables(column.val, self.context.sublink_exterior_columns)
+            irrelevant_tables = set(self.top_level.tables) - set(involved_tables)
+            if len(irrelevant_tables) == 0:
                 # hole involves every table , so skip Phase 2
                 self.outer_tables = []
                 return
             # randomly choose one table involved in hole to be outer table
-            self.outer_tables = next(iter(tables_not_in_hole))
+            self.outer_tables = next(iter(irrelevant_tables))
         else:
-            self.outer_tables = self.center_tables
+            self.outer_tables = center_tables
     
     def check_crosses(self, tables: List[str]):
         """check whether a list of tables contain both an outer table and an inner table
@@ -142,10 +144,23 @@ class Phase2:
         visitor(self.node)
         branches = []
         for root, branch_conditions in visitor.branches:
-            copied_root = deepcopy(root)
-            add_predicates_to_where(copied_root, branch_conditions)
-            branches.append(copied_root)
+            # optimize common case: sum/min/max(0)
+            if Phase2.check_trivial_aggregate(root.targetList[0].val):
+                root = SELECT_SUM_ZERO
+            else:
+                add_predicates_to_where(root, branch_conditions)
+            branches.append(root)
         return branches
+    
+    @staticmethod
+    def check_trivial_aggregate(node: pglast.ast.Node):
+        """check if node is sum/min/max(0)"""
+        return isinstance(node, pglast.ast.FuncCall) and \
+                node.funcname[0].val == "sum" and \
+                isinstance(node.args[0], pglast.ast.A_Const) and \
+                isinstance(node.args[0].val, pglast.ast.Integer) and \
+                node.args[0].val.val == 0
+        
     
     def expand_crossing_conjuncts(self, root: pglast.ast.SelectStmt):
         """Given a select statement ast_node, expand its crossing disjunctions into different branches
@@ -154,16 +169,18 @@ class Phase2:
            assume outer_tables has been computed
         """
         penalty = self.add_on_predicates_to_where(root)
-        # convert WHERE clause to CNF form
-        if not isinstance(root.whereClause, pglast.ast.BoolExpr):
+        if root.whereClause is None:
             return [root], penalty
+        # convert WHERE clause to CNF form
         formula, vars = construct_formula_from_ast_node(root.whereClause)
         formula = simplify_formula(formula)
         formula = convert_formula_to_cnf(formula)
+        # evaluates to FALSE
+        if formula.decl().kind() == z3.Z3_OP_FALSE:
+            return [], False
         cnf_where_node = construct_ast_node_from_formula_dfs(formula, vars)
-        if not isinstance(cnf_where_node, pglast.ast.BoolExpr):
-            root.whereClause = cnf_where_node
-            return [root], penalty
+        if not isinstance(cnf_where_node, pglast.ast.BoolExpr) or cnf_where_node.boolop is not BoolExprType.AND_EXPR:
+            cnf_where_node = pglast.ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=(cnf_where_node,))
         # split crossing conjuncts
         where_branches = [cnf_where_node]
         for index, conjunct in enumerate(cnf_where_node.args):
@@ -174,13 +191,15 @@ class Phase2:
             assert(conjunct.boolop is BoolExprType.OR_EXPR)
             replacement_predicates = []
             non_crossing_predicates = []
-            for predicate in conjunct.args:
-                involved_tables = find_involved_tables(predicate, self.context.sublink_exterior_columns)
+            for disjunct in conjunct.args:
+                involved_tables = find_involved_tables(disjunct, self.context.sublink_exterior_columns)
                 if self.check_crosses(involved_tables):
-                    replacement_predicates.append(predicate)
+                    replacement_predicates.append(disjunct)
                 else:
-                    non_crossing_predicates.append(predicate)
-            replacement_predicates.append(ast_BoolExpr(BoolExprType.OR_EXPR, non_crossing_predicates))
+                    non_crossing_predicates.append(disjunct)
+            non_crossing_predicates_node = ast_BoolExpr(BoolExprType.OR_EXPR, non_crossing_predicates)
+            if non_crossing_predicates_node is not None:
+                replacement_predicates.append(non_crossing_predicates_node)
             # construct new branches
             next_where_branches = []
             for where_branch in where_branches:
@@ -199,7 +218,6 @@ class Phase2:
             if formula.decl().kind() == z3.Z3_OP_FALSE:
                 # condition evaluates to false
                 continue
-            # formula = convert_formula_to_cnf(formula)
             where_branch = construct_ast_node_from_formula_dfs(formula, vars)
             new_root.whereClause = where_branch
             branches.append(new_root)
@@ -209,10 +227,12 @@ class Phase2:
         """Add all predicates appearing in ON clause to WHERE clause
            Incur penalty when doing so is not safe
         """
+        if root.fromClause is None:
+            return
         top_level = TopLevelAnalyzer(root)
         top_level()
-        top_level.replace_column_alias_usage()
-        _, safety = top_level.find_null_graph_and_safety(self.context.sublink_exterior_columns)
+        self.top_level.replace_column_alias_usage()
+        _, safety = self.top_level.find_null_graph_and_safety(self.context.sublink_exterior_columns)
         # fetch all predicates in "ON" clause
         class OnPredicateFetcher(Visitor):
             def __init__(self):
@@ -241,25 +261,33 @@ class Phase2:
             
 
 if __name__ == "__main__":
-    schema_file = "1212schema.json"
+    schema_file = "testschema.json"
     with open(schema_file) as file:
         schema = json.load(file)
-    # sql1 = """SELECT sum(a.a2 + b.b1) col FROM a LEFT JOIN b ON (a.a1 < 1 AND a.a1 <= b.b1) INNER JOIN c ON a.a1 = c.c1  WHERE (a.a1 <= a.a2) GROUP BY a.a1"""
-    sql2 = """
-    SELECT  t.team_id
-       ,t.team_name
-       ,(SUM(CASE WHEN ((t.team_id = m.host_team) AND (m.host_goals > m.guest_goals)) OR ((t.team_id = m.guest_team) AND (m.host_goals < m.guest_goals)) THEN 3 ELSE 0 END)) AS num_points
-FROM Teams AS t
-CROSS JOIN Matches AS m
-GROUP BY  t.team_id
-         ,t.team_name
-ORDER BY num_points DESC
-         ,t.team_id ASC"""
-    full_analyzer = FullAnalyzer(sql2, schema)
+    sql = """SELECT sum(a.a2 + b.b1) col FROM a LEFT JOIN b ON (a.a1 < 1 OR a.a1 <= b.b1) INNER JOIN c ON a.a1 = c.c1  WHERE b.b1 < 1 GROUP BY a.a1"""
+#     sql = """
+#     SELECT  t.team_id
+#        ,t.team_name
+#        ,(SUM(CASE WHEN ((t.team_id = m.host_team) AND (m.host_goals > m.guest_goals)) OR ((t.team_id = m.guest_team) AND (m.host_goals < m.guest_goals)) THEN 3 ELSE 0 END)) AS num_points
+# FROM Teams AS t
+# CROSS JOIN Matches AS m
+# GROUP BY  t.team_id
+#          ,t.team_name
+# ORDER BY num_points DESC
+#          ,t.team_id ASC"""
+#     sql = """SELECT a.id, a.a1 FROM a INNER JOIN b ON a.id = b.id1"""
+#     sql = """WITH all_users AS
+# (
+#        SELECT  distinct calls.from_id AS id
+#        FROM calls union
+#        SELECT  distinct calls.to_id AS id
+#        FROM calls
+# ) SELECT count(c.duration) AS agg FROM all_users AS a INNER JOIN all_users AS b ON a.id < b.id INNER JOIN calls AS c ON (((a.id = c.from_id) AND (b.id = c.to_id)) OR ((a.id = c.to_id) AND (b.id = c.from_id))) GROUP BY a.id, b.id"""
+    full_analyzer = FullAnalyzer(sql, schema)
     context = full_analyzer()
     node = context.table_node[TOP]
-    phase2 = Phase2(node, context, ['t'])
-    phase2.find_outer_table()
+    phase2 = Phase2(node, context, ["a"])
+    phase2.find_outer_tables()
     case_branches = phase2.expand_crossing_case_when()
     print("Case branches")
     for index, case_branch in enumerate(case_branches):

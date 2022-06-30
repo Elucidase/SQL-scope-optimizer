@@ -1,10 +1,13 @@
+from copy import deepcopy
+import itertools
 import pglast
 from pglast import parse_sql
 from pglast.visitors import Visitor
-from typing import Dict, Set, Tuple
+from typing import Dict, List, Set, Tuple
 from pglast.enums.nodes import JoinType
+from pglast.enums.primnodes import BoolExprType
 from prometheus_client import Counter
-from common import Column, check_null_sensitive_dfs, find_involved_tables, decompose_predicate, reversed_graph, AGGREGATE_NAMES, Counter
+from common import Column, add_predicates_to_where, ast_BoolExpr, check_null_sensitive_dfs, connected_component_dfs, find_involved_tables, decompose_predicate, reversed_graph, AGGREGATE_NAMES, Counter, translate
 
 
 # Assumptions
@@ -17,8 +20,6 @@ class TopLevelAnalyzer:
         node (pglast.ast.Node): current node
         tables (list[str]): list of top-level table names
         target_columns: dict: column_name -> Column object for those declared in SELECT
-        center_exact_inner (list): for each group-by column, if column is t.c for some inner table t, then (t, c);
-            else if column is a column in SELECT, then alias name; else None
         """
         if not isinstance(node, pglast.ast.Node):
             raise Exception("ToplevelAnalyzer accepts ast.Node, not node.Node")
@@ -26,6 +27,9 @@ class TopLevelAnalyzer:
         self.tables: list[str] = None
         self.target_columns: Dict[str, Column] = None
         self.group_columns: list[Column] = None
+        self.equalities = []
+        self.equality_graph: Dict[Tuple[str, str], List[Tuple[str, str]]] = None
+        self.equality_cluster_of: Dict[Tuple[str, str], Set[Tuple[str, str]]] = None
         
     def __call__(self):
         self.find_top_level_tables()
@@ -50,7 +54,8 @@ class TopLevelAnalyzer:
             def visit_RangeSubselect(self, _, node):
                 self.top_level_tables.append(node.alias.aliasname)
                 return pglast.visitors.Skip()
-            # do not consider SubLink yet
+            def visit_CommonTableExpr(self, _, node):
+                return pglast.visitors.Skip()
             def visit_SubLink(self, _, node):
                 return pglast.visitors.Skip()
         visitor = TopLevelTableVisitor()
@@ -97,6 +102,20 @@ class TopLevelAnalyzer:
             self.group_columns.append(group_column)
         return self.group_columns
     
+    def find_center_tables(self):
+        """fill in center_tables
+           assume group_columns is filled
+        """
+        if self.node.groupClause is None:
+            center_tables = []
+        else:
+            center_tables = set()
+            for group_column in self.group_columns:
+                for table, column in group_column.dependsOn:
+                    center_tables.add(table)
+            center_tables = list(center_tables)
+        return center_tables
+    
     def replace_column_alias_usage(self):
         """replace each reference to a column alias (defined in SELECT clause) in an ON/WHERE clause with actual content
            assume target_columns is filled
@@ -116,9 +135,40 @@ class TopLevelAnalyzer:
                 return pglast.visitors.Skip() 
         for column_name, column_obj in self.target_columns.items():
             replace_visitor = ReplaceVisitor(column_name, column_obj.val)
-            replace_visitor(self.node.fromClause[0])
+            if self.node.fromClause is not None:
+                replace_visitor(self.node.fromClause[0])
             if self.node.whereClause is not None:
                 replace_visitor(self.node.whereClause)
+                
+    def fetch_all_predicates(self):
+        """fetch all predicates present in ON/WHERE clauses"""
+        class PredicateFetcher(Visitor):
+            def __init__(self, predicates):
+                self.predicates = predicates
+
+            def visit_JoinExpr(self, _, node):
+                if node.quals is not None and not isinstance(node.quals, pglast.ast.BoolExpr):
+                    self.predicates.append(node.quals)
+
+            def visit_BoolExpr(self, _, node):
+                for arg in node.args:
+                    if not isinstance(arg, pglast.ast.BoolExpr):
+                        self.predicates.append(arg)
+
+            def visit_RangeSubselect(self, _, node):
+                return pglast.visitors.Skip()
+            def visit_SubLink(self, _, node):
+                return pglast.visitors.Skip()
+        predicates = []
+        predicate_fetcher = PredicateFetcher(predicates)
+        if self.node.fromClause is not None:
+            predicate_fetcher(self.node.fromClause[0])
+        if self.node.whereClause is not None:
+            if not isinstance(self.node.whereClause, pglast.ast.BoolExpr):
+                predicates.append(self.node.whereClause)
+            else:
+                predicate_fetcher(self.node.whereClause)
+        return predicates
     
     def find_null_graph_and_safety(self, sublink_exterior_columns: Dict[str, Set[Tuple[str, str]]]):
         """find null-graph
@@ -139,6 +189,8 @@ class TopLevelAnalyzer:
            each of its ancestors (including itself) participates in can be transformed to an
            LEFT or INNER JOIN where the said ancestor acts as the left side of the join. 
         """
+        if self.node.fromClause is None:
+            return {}, {}
         edges = {table: [] for table in self.tables}
         safety = self.construct_null_edges_from_join_dfs(self.node.fromClause[0], edges, sublink_exterior_columns)
         # construct edges from WHERE clause
@@ -212,7 +264,7 @@ class TopLevelAnalyzer:
     def find_holes(self):
         """Find all holes"""
         # assume top-level select statement does not have set operation
-        if self.node.op.value != pglast.enums.parsenodes.SetOperation.SETOP_NONE:
+        if self.node.op is not pglast.enums.parsenodes.SetOperation.SETOP_NONE:
             raise Exception("Can only find holes for select statements without top-level set operation")
         class HoleVisitor(Visitor):
             def __init__(self):
@@ -221,8 +273,8 @@ class TopLevelAnalyzer:
             def visit_FuncCall(self, _, node):
                 if node.funcname[0].val in AGGREGATE_NAMES:
                     self.holes.append(node)
-                # record this is the nth hole
-                node.location = self.counter.count()
+                    # record this is the nth hole
+                    node.location = self.counter.count()
             def visit_WithClause(self, _, node):
                 return pglast.visitors.Skip()
             def visit_RangeSubselect(self, _, node):
@@ -241,16 +293,19 @@ class TopLevelAnalyzer:
                 self.table_name = table_name
 
             def visit_JoinExpr(self, _, node):
-                if isinstance(node.larg, pglast.ast.RangeVar):
-                    rangeVar = node.larg
-                    table_name = rangeVar.alias.aliasname if rangeVar.alias else rangeVar.relname
-                    if table_name == self.table_name:
-                        return node.rarg
-                if isinstance(node.rarg, pglast.ast.RangeVar):
-                    rangeVar = node.rarg
-                    table_name = rangeVar.alias.aliasname if rangeVar.alias else rangeVar.relname
-                    if table_name == self.table_name:
-                        return node.larg
+                if self.get_table_name(node.larg) == self.table_name:
+                    return node.rarg
+                if self.get_table_name(node.rarg) == self.table_name:
+                    return node.larg
+                
+            @staticmethod
+            def get_table_name(node: pglast.ast.Node):
+                if isinstance(node, pglast.ast.RangeVar):
+                    return node.alias.aliasname if node.alias else node.relname
+                elif isinstance(node, pglast.ast.RangeSubselect):
+                    return node.alias.aliasname
+                else:
+                    return None
 
             def visit_RangeSubselect(self, _, node):
                 return pglast.visitors.Skip()
@@ -259,6 +314,148 @@ class TopLevelAnalyzer:
                 return pglast.visitors.Skip()
         remove_table_vistor = RemoveTableVisitor(table_name)
         remove_table_vistor(self.node)
+        
+    def construct_equality_graph(self, context_columns: Dict[str, Dict[str, Column]], conjunct_only=True):
+        """build a graph with (top_level_table, column) as vertices, equalities as edges
+           find equality_graph, equality_cluster_of, and equalities
+        """
+        # initialize graph
+        self.equality_graph = {}
+        self.equality_cluster_of = {}
+        for table in self.tables:
+            for column in context_columns[table]:
+                self.equality_graph[(table, column)] = []
+        self.equalities = []
+        if conjunct_only:
+            # only consider equalities that are definitely true
+            if self.node.whereClause is not None:
+                self.equalities = TopLevelAnalyzer.find_all_equalities_dfs(self.node.whereClause)
+        else:
+            # consider all equalities scattered around the top level
+            predicates = self.fetch_all_predicates()
+            for predicate in predicates:
+                equality = TopLevelAnalyzer.extract_node_equality(predicate)
+                if equality is not None:
+                    self.equalities.append(equality)
+        self.equalities = list(set(self.equalities))
+        # create edges
+        for vertex1, vertex2 in self.equalities:
+            self.equality_graph[vertex1].append(vertex2)
+            self.equality_graph[vertex2].append(vertex1)
+        # build cluster cache
+        visited = set()
+        for table in self.tables:
+            for column in context_columns[table]:
+                if (table, column) in visited:
+                    continue
+                component = []
+                connected_component_dfs((table, column), self.equality_graph, visited, component)
+                component_set = set(component)
+                for vertex in component:
+                    self.equality_cluster_of[vertex] = component_set
+    
+    @staticmethod
+    def find_all_equalities_dfs(node: pglast.ast.Node):
+        """get all equalities that are conjuncts of WHERE clause"""
+        if not isinstance(node, pglast.ast.BoolExpr):
+            equality = TopLevelAnalyzer.extract_node_equality(node)
+            return [equality] if equality is not None else []
+        if node.boolop is not BoolExprType.AND_EXPR:
+            return []
+        return list(itertools.chain(*[TopLevelAnalyzer.find_all_equalities_dfs(conjunct) for conjunct in node.args]))
+    
+    @staticmethod
+    def extract_node_equality(node: pglast.ast.Node):
+        """if the node is A_Expr of the form t1.c1 = t2.c2, returns [(t1, c1), (t2, c2)]; otherwise None"""
+        if not isinstance(node, pglast.ast.A_Expr):
+            return None
+        if node.name[0].val != "=":
+            return None
+        if not isinstance(node.lexpr, pglast.ast.ColumnRef) or not isinstance(node.rexpr, pglast.ast.ColumnRef):
+            return None
+        assert(len(node.lexpr.fields) == 2)
+        assert(len(node.rexpr.fields) == 2)
+        left_column = (node.lexpr.fields[0].val, node.lexpr.fields[1].val)
+        right_column = (node.rexpr.fields[0].val, node.rexpr.fields[1].val)
+        return (left_column, right_column)
+        
+    def translate_predicates_dfs(self, node: pglast.ast.Node, translate_map: Dict[Tuple[str, str], pglast.ast.Node]):
+        """returns translated_node, penalty; 
+           translated_node is the conjunction of translatable conjuncts, or None if no conjunct is translatable
+        """
+        if not isinstance(node, pglast.ast.BoolExpr):
+            translated = translate(node, translate_map)
+            if translated is None:
+                return None, 1
+            # special case: if after translation it is t.c = t.c, then ignore
+            equality = TopLevelAnalyzer.extract_node_equality(translated)
+            if equality is not None and equality[0] == equality[1]:
+                return None, 0
+            return translated, 0
+        # node is BoolExpr
+        translated_args = []
+        penalty = 0
+        for arg in node.args:
+            arg_translated, arg_penalty = self.translate_predicates_dfs(arg, translate_map)
+            if arg_translated is not None:
+                translated_args.append(arg_translated)
+            penalty += arg_penalty
+        if node.boolop is BoolExprType.AND_EXPR or penalty == 0:
+            translated = ast_BoolExpr(node.boolop, translated_args)
+        else:
+            translated = None
+        return translated, penalty
+    
+    def translate_targets(self, translate_map: Dict[Tuple[str, str], pglast.ast.Node]):
+        """replace target column with the translated one"""
+        translated_target_list = []
+        for column in self.target_columns.values():
+            resTarget = pglast.ast.ResTarget(name=column.name, val=translate(column.val, translate_map))
+            translated_target_list.append(resTarget)
+        self.node.targetList = translated_target_list
+    
+    def translate_where_predicates(self, translate_map: Dict[Tuple[str, str], pglast.ast.Node]):
+        """replace outer table columns in whereClause with inner table columns; remove predicates we can't translate
+           returns penalty, i.e. number of predicates we removed because we can't translate
+           assume translated_map is constructed
+        """
+        if self.node.whereClause is None:
+            return 0
+        translated, penalty = self.translate_predicates_dfs(self.node.whereClause, translate_map)
+        self.node.whereClause = translated
+        return penalty
+    
+    def translate_join_on_dfs(self, join: pglast.ast.JoinExpr, translate_map: Dict[Tuple[str, str], pglast.ast.Node]):
+        """translate on conditions and return penalty of translation"""
+        if not isinstance(join, pglast.ast.JoinExpr):
+            return 0
+        penalty = 0
+        penalty += self.translate_join_on_dfs(join.larg, translate_map)
+        penalty += self.translate_join_on_dfs(join.rarg, translate_map)
+        translated, my_penalty = self.translate_predicates_dfs(join.quals, translate_map)
+        join.quals = translated
+        penalty += my_penalty
+        if translated is None:
+            # cross join
+            join.jointype = JoinType.JOIN_INNER
+        return penalty
+    
+    def translate_order_by(self, translate_map: Dict[Tuple[str, str], pglast.ast.Node]):
+        """translate order by nodes and return penalty of translation"""
+        if self.node.sortClause is None:
+            return 0
+        penalty = 0
+        new_order_by = []
+        for sort_by in self.node.sortClause:
+            translated = translate(sort_by.node, translate_map)
+            if translated is not None:
+                sort_by.node = translated
+                new_order_by.append(sort_by)
+            else:
+                penalty += 1
+        self.orderClause = new_order_by if len(new_order_by) > 0 else None
+        return penalty
+    
         
     
 if __name__ == "__main__":           
