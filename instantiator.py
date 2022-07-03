@@ -10,8 +10,7 @@ from pglast.enums.nodes import JoinType
 from copy import deepcopy
 from typing import Any, Dict, Optional, Set, Tuple, List
 
-from sqlalchemy import false
-from common import HOLE_AGG_NAME, AGGREGATE_NAMES, SELECT_EMPTY, SELECT_SUM_ZERO, TOP, Column, Counter, FullContext, ast_BoolExpr, find_involved_columns, find_involved_tables, TranslationPayload, translate
+from common import HOLE_AGG_NAME, AGGREGATE_NAMES, SELECT_EMPTY, SELECT_SUM_ZERO, Column, Counter, FullContext, ast_BoolExpr, find_involved_columns, find_involved_tables, translate
 from full_analyzer import FullAnalyzer
 from top_level_analyzer import TopLevelAnalyzer
 from branch_builder import Branch, BranchBuilder
@@ -19,12 +18,12 @@ from branch_builder import Branch, BranchBuilder
 
 class InstantiatedBranch:
     def __init__(
-        self, 
-        root: pglast.ast.SelectStmt, 
-        free: bool, 
+        self,
+        root: pglast.ast.SelectStmt,
+        free: bool,
         target_names: List[str],
-        link_target_map: Dict[str, str], 
-        value_map: Dict[Tuple[str, str], pglast.ast.Node], 
+        link_target_map: Dict[str, str],
+        value_map: Dict[Tuple[str, str], pglast.ast.Node],
         value_target_map: Dict[Tuple[str, str], str],
         ):
         self.root = root
@@ -35,40 +34,41 @@ class InstantiatedBranch:
         self.value_map = value_map
         # map from outermost (table, column) to name of inner target column that corresonds to it
         self.value_target_map = value_target_map
-        
+
     def empty_instbranch():
         return InstantiatedBranch(SELECT_EMPTY, True, [], {}, {})
-    
+
     def zero_instbranch():
         return InstantiatedBranch(SELECT_SUM_ZERO, True, [HOLE_AGG_NAME], {}, {})
 
     @staticmethod
     def check_empty_instbranch(branch: InstantiatedBranch):
         return RawStream()(branch.root) == RawStream()(SELECT_EMPTY)
-    
+
     @staticmethod
     def check_zero_instbranch(branch: InstantiatedBranch):
         return RawStream()(branch.root) == RawStream()(SELECT_SUM_ZERO)
-    
+
     @staticmethod
     def parse_link_orign_str(origin_str: str):
         """parse the keys of link_target_map in to pglast.ast.Node"""
         return pglast.parse_sql(f"SELECT {origin_str}")[0].stmt.targetList[0].val
-    
-    
+
+
 class Instantiator:
-    
+
     def __init__(self, id_to_branch, context: FullContext):
         self.context = context
         self.id_to_branch: Dict[int, List[Branch]] = id_to_branch
         self.id_to_instbranch: Dict[int, List[InstantiatedBranch]] = {}
-        
+
     def instantiate(self):
         self.instantiate_id_dfs(1)
         return self.id_to_instbranch[1]
-    
+
     def instantiate_id_dfs(self, id: int):
         """instantiate all possibilities for this id, cache in id_to_instbranch"""
+        print("instantiating id", id, flush=True)
         instantiated = self.id_to_instbranch[id] = []
         seen_text_form = set()
         for branch in self.id_to_branch[id]:
@@ -169,9 +169,9 @@ class Instantiator:
             target_list.append(pglast.ast.ResTarget(name=column_name, val=node))
         root.targetList = [*target_list, *root.targetList]
         target_names = [target.name for target in root.targetList]
-        return InstantiatedBranch(root, false, target_names, link_target_map, branch.value_map, branch.value_target_map)
+        return InstantiatedBranch(root, False, target_names, link_target_map, branch.value_map, branch.value_target_map)
     
-    ### merge "set operation" children type
+    # merge "set operation" children type
             
     def instantiate_merge_set_op(self, parent: Branch, children: List[InstantiatedBranch]):
         """merge children when the split type is set operation
@@ -322,7 +322,7 @@ class Instantiator:
                 root = table_node.subquery
         return root, agg_target_name
     
-    ### merge "hole" children type
+    # merge "hole" children type
     
     def instantiate_merge_hole(self, parent: Branch, children: List[InstantiatedBranch]):
         assert(parent.children_type is SetOperation.SETOP_NONE)
@@ -639,60 +639,9 @@ class Instantiator:
                 return node
         replace_table_visitor = ReplaceTableVisitor(replace_center, children_names)
         replace_table_visitor(root)
-
-schema_file="testschema.json"
-with open(schema_file) as file:
-    schema = json.load(file)
-
-# sql="""
-#     SELECT  t.team_id
-#        ,t.team_name
-#        ,(SUM(CASE WHEN ((t.team_id = m.host_team) AND (m.host_goals > m.guest_goals)) OR ((t.team_id = m.guest_team) AND (m.host_goals < m.guest_goals)) THEN 3 ELSE 0 END)) AS num_points
-# FROM Teams AS t
-# CROSS JOIN Matches AS m
-# GROUP BY  t.team_id
-#          ,t.team_name
-# ORDER BY num_points DESC
-#          ,t.team_id ASC"""
+        
 # sql = """SELECT a.id, SUM(b0.b1) su FROM a INNER JOIN (SELECT id1, b1 FROM b) b0 ON a.id = b0.id1 GROUP BY a.id"""
 # sql = """SELECT SUM(c1) su FROM (SELECT a.id c0, a.a1 c1 FROM a UNION SELECT b.id1 c0, b.b1 c1 FROM b) tt GROUP BY c0"""
-# sql = """SELECT  t1.contest_id
-#        ,round(cast(div((COUNT(t2.user_id)) * 100,COUNT(t1.user_id)) AS numeric),2) AS percentage
-# FROM
-# (
-# 	SELECT  *
-# 	FROM
-# 	(
-# 		SELECT  distinct register.contest_id
-# 		FROM register
-# 	) AS co
-# 	CROSS JOIN
-# 	(
-# 		SELECT  distinct users.user_id
-# 		FROM users
-# 	) AS us
-# ) AS t1
-# LEFT JOIN register AS t2
-# ON (t1.contest_id = t2.contest_id) AND (t1.user_id = t2.user_id)
-# GROUP BY  t1.contest_id
-# ORDER BY percentage desc
-#          ,t1.contest_id asc"""
-# sql = """WITH all_users AS
-# (
-#        SELECT  distinct calls.from_id AS id
-#        FROM calls union
-#        SELECT  distinct calls.to_id AS id
-#        FROM calls
-# )
-# SELECT  a.id            AS person1
-#        ,b.id            AS person2
-#        ,COUNT(c.duration) AS call_count
-#        ,SUM(c.duration)   AS total_duration
-# FROM      all_users a
-#      JOIN all_users b ON a.id<b.id
-#      JOIN calls c ON (a.id = c.from_id AND b.id = c.to_id ) or (a.id = c.to_id AND b.id = c.from_id )
-# GROUP BY  a.id
-#          ,b.id"""
 # sql = "SELECT COUNT(bb.b1) col FROM a INNER JOIN (SELECT * FROM b) bb ON a.a1 = bb.b1 WHERE (CASE WHEN a.id < bb.id2 THEN 1 ELSE 20 END) < 10 GROUP BY a.a1"
 # sql = "SELECT COUNT(bb.b1) col FROM a INNER JOIN (SELECT * FROM b b11 UNION SELECT * FROM b b12) bb ON a.a1 = bb.b1 WHERE (CASE WHEN a.id < bb.id2 THEN 1 ELSE 20 END) < 10 GROUP BY a.a1"
 # sql = "SELECT COUNT(z.z1) col1 FROM c INNER JOIN (SELECT c.c1 z1, SUM(b.b1) z2 FROM c CROSS JOIN b GROUP BY c.id) z ON c.id = z.z1 WHERE z.z2 > 1 GROUP BY c.id"
@@ -705,30 +654,3 @@ with open(schema_file) as file:
 # sql = "SELECT SUM(z.z1) col1 FROM c INNER JOIN (SELECT y.a1 z1, SUM(y.a2) z2 FROM (SELECT a.a1 a1, SUM(a.a1) a2 FROM a) y) z ON c.id = z.z1 WHERE z.z2 < 1 GROUP BY c.id"
 # sql = "SELECT SUM(z.z1) col1 FROM c INNER JOIN (SELECT a.a1 z1, ABS(SUM(a.a1)) z2 FROM a) z ON c.id = z.z1 WHERE z.z2 < 1 GROUP BY c.id"
 # sql = "SELECT a.id, SUM(b.b1) col FROM a INNER JOIN b ON a.id = b.id1 GROUP BY a.id"
-
-
-def main(sql, schema):
-    # analyze incoming sql
-    full_analyzer=FullAnalyzer(sql, schema)
-    context=full_analyzer()
-    root = context.table_node[TOP] 
-    branch_builder = BranchBuilder(root, context)
-    id_to_branch = branch_builder.build()
-    instantiator = Instantiator(id_to_branch, context)
-    return id_to_branch, instantiator.instantiate()
-
-if __name__ == "__main__":
-    id_to_branch, instbranches = main(sql, schema)
-    for id, branches in id_to_branch.items():
-        print(id)
-        for branch in branches:
-            print(RawStream()(branch.root))
-            print(
-                f"children ({branch.children_type}):", branch.children, 
-                "free:", branch.free,
-                "links:", branch.translation_payload.links, 
-                "value_map:", branch.translation_payload.value_map
-            )
-    print("instantiated results:")
-    for instbranch in instbranches:
-        print(RawStream()(instbranch.root))

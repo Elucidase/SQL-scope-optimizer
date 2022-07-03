@@ -1,0 +1,66 @@
+{
+  "Problem Number": "1364",
+  "Tables": [
+    {
+      "TableName": "customers",
+      "PKeys": [
+        {
+          "Name": "customer_id",
+          "Type": "int"
+        }
+      ],
+      "FKeys": [],
+      "Others": [
+        {
+          "Name": "customer_name",
+          "Type": "varchar"
+        },
+        {
+          "Name": "email",
+          "Type": "varchar"
+        }
+      ]
+    },
+    {
+      "TableName": "contacts",
+      "PKeys": [
+        {
+          "Name": "user_id",
+          "Type": "int"
+        },
+        {
+          "Name": "contact_email",
+          "Type": "varchar"
+        }
+      ],
+      "FKeys": [],
+      "Others": [
+        {
+          "Name": "contact_name",
+          "Type": "varchar"
+        }
+      ]
+    },
+    {
+      "TableName": "invoices",
+      "PKeys": [
+        {
+          "Name": "invoice_id",
+          "Type": "int"
+        }
+      ],
+      "FKeys": [],
+      "Others": [
+        {
+          "Name": "price",
+          "Type": "int"
+        },
+        {
+          "Name": "user_id",
+          "Type": "int"
+        }
+      ]
+    }
+  ],
+  "Tuples": []
+}

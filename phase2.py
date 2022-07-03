@@ -9,7 +9,7 @@ from full_analyzer import FullAnalyzer, FullContext
 from typing import Dict, Set, Tuple, List
 from pglast.stream import RawStream
 from copy import deepcopy
-from common import SELECT_SUM_ZERO, TOP, deduplicate_nodes_by_stream, find_involved_tables, add_predicates_to_where, ast_BoolExpr
+from common import SELECT_SUM_ZERO, TOP, deduplicate_nodes_by_fingerprint, deduplicate_nodes_by_stream, find_involved_tables, add_predicates_to_where, ast_BoolExpr
 from pglast_z3 import construct_formula_from_ast_node, construct_ast_node_from_formula_dfs, convert_formula_to_cnf, simplify_formula
 import z3
 
@@ -29,7 +29,9 @@ class Phase2:
         """find outer tables, which will be used to determine whether a predicate "crosses"
         """
         center_tables = self.top_level.find_center_tables()
-        if len(center_tables) == 0 or len(center_tables) == len(self.top_level.tables):
+        if len(self.top_level.tables) == 1:
+            self.outer_tables = []
+        elif len(center_tables) == 0 or len(center_tables) == len(self.top_level.tables):
             # no center table or everything is center table
             involved_tables = set()
             for column in self.top_level.target_columns.values():
@@ -221,7 +223,7 @@ class Phase2:
             where_branch = construct_ast_node_from_formula_dfs(formula, vars)
             new_root.whereClause = where_branch
             branches.append(new_root)
-        return branches, penalty
+        return deduplicate_nodes_by_fingerprint(branches), penalty
     
     def add_on_predicates_to_where(self, root: pglast.ast.SelectStmt):
         """Add all predicates appearing in ON clause to WHERE clause

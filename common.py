@@ -322,3 +322,14 @@ def deduplicate_nodes_by_stream(nodes: List[pglast.ast.Node]):
             seen.add(text_form)
             new_nodes.append(node)
     return new_nodes
+
+def deduplicate_nodes_by_fingerprint(nodes: List[pglast.ast.SelectStmt]):
+    """deduplicate a list of expressions based on RawStream() output"""
+    seen = set()
+    new_nodes = []
+    for node in nodes:
+        fingerprint = pglast.parser.fingerprint(RawStream()(node))
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            new_nodes.append(node)
+    return new_nodes

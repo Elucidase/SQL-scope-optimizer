@@ -123,7 +123,7 @@ class Phase3:
         } 
     
     def check_center_is_unique(self):
-        """check if the tuple of group-by columns is unique
+        """check if the tuple of group-by columns functionally determines all outer table fields
            assume top_level.equality_graph has been constructed
         """
         # all group-by columns of the form top_level_table.column
@@ -131,9 +131,14 @@ class Phase3:
         for column in self.top_level.group_columns:
             if isinstance(column.exact_inner, tuple):
                 exact_center_columns.add(column.exact_inner)
-        all_columns_count = sum(len(self.context.columns[table]) for table in self.top_level.tables)
+        outer_table_columns = set()
+        for table in self.top_level.tables:
+            if table not in self.outer_tables:
+                continue
+            for column_name in self.context.columns[table]:
+                outer_table_columns.add((table, column_name))
         functionally_dependent_columns = self.find_functionally_dependent_columns(exact_center_columns)
-        return len(functionally_dependent_columns) == all_columns_count
+        return functionally_dependent_columns >= outer_table_columns
     
     def check_all_one_to_one(self):
         """check if all joins are one-to-one joins

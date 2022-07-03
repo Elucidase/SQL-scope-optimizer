@@ -293,6 +293,10 @@ class BranchBuilder:
         if len(phase3.outer_tables) == 0:
             # nothing to push in
             return results
+        # if translation_payload.links is dummy, reset it to None so that it can be reinitialized
+        if phase3.translation_payload.links is not None and \
+            any(BranchBuilder.check_dummy_origin_str(origin_str) for origin_str in phase3.translation_payload.links):
+            phase3.translation_payload.links = None
         phase3.construct_equality_graph()
         keys_outer = None
         all_one_to_one_success, center_is_unique_success = False, False
@@ -308,10 +312,7 @@ class BranchBuilder:
         if not all_one_to_one_success and not center_is_unique_success:
             # can't push in
             return results
-        # if translation_payload.links is dummy, reset it to None so that it can be reinitialized
-        if phase3.translation_payload.links is not None and \
-            any(BranchBuilder.check_dummy_origin_str(origin_str) for origin_str in phase3.translation_payload.links):
-            phase3.translation_payload.links = None
+
         phase3.update_translation_payload()
         translate_penalty = phase3.prepare_for_push_in()
         # actually push in
